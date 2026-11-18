@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body {
+    background-color: #09090b;
+    color: #f4f4f5;
+    overscroll-behavior: none;
+  }
+
+  /* Custom sleek scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #101014;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #272732;
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #3f3f50;
+  }
+}
+
+/* Custom range slider for scrub bar */
+input[type='range'].study-scrubber {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+input[type='range'].study-scrubber::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 14px;
+  width: 14px;
+  border-radius: 9999px;
+  background: #fbbf24;
+  border: 2px solid #09090b;
+  box-shadow: 0 0 10px rgba(251, 191, 36, 0.5);
+  transition: transform 0.15s ease;
+}
+
+input[type='range'].study-scrubber:hover::-webkit-slider-thumb {
+  transform: scale(1.25);
+}
