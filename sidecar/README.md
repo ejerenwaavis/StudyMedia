@@ -1,82 +1,35 @@
-# StudyMedia Home Sidecar
+# StudyMedia Home Sidecar (Zero-Trust Private Tailscale Serve)
 
-Lightweight, private Node/Express extraction server (`yt-dlp` + `ffmpeg`) that runs on your home desktop, locks access behind an `x-api-key` secret + CORS allowlist, and streams MP4/MP3 lectures straight into StudyMedia's offline IndexedDB storage.
+Hardened Node/Express extraction server (`yt-dlp` + `ffmpeg`) bound strictly to `127.0.0.1:4848` and exposed **exclusively** inside your private WireGuard Tailnet via **`tailscale serve`** (never `tailscale funnel`).
 
-## Prerequisites
-- **Node.js 18+**
-- **`yt-dlp`** and **`ffmpeg`** installed and available on your system `PATH`
-- **`cloudflared`** installed (for private remote phone access)
+## Security Architecture
+- **0% Public Internet Exposure:** `tailscale serve` is reachable **only** by devices authenticated to your private Tailscale Tailnet. Zero open router ports, zero public DNS exposure.
+- **Loopback-Only Enforcement:** Express binds to `127.0.0.1:4848` and actively rejects any non-loopback TCP socket.
+- **Defense-in-Depth Inside Tailnet:**
+  - Constant-time `x-api-key` verification (`crypto.timingSafeEqual`) + 15-minute lockout after 10 failed attempts (`HTTP 429`).
+  - Strict CORS + Chrome Private Network Access allowlist (`https://studymedia.aceddivision.com` and `http://localhost:5173` only).
+  - `yt-dlp` executed with argument arrays, `--no-exec`, `--no-playlist`, `--`, `250M` max size, `180s` timeout, max 2 concurrent jobs, rate limiting, and immediate temp-file cleanup.
 
----
-
-## 3-Step Quick Startup
-
-### Step 1: Install Dependencies & Configure `.env`
-```bash
-cd sidecar
-npm install
-```
-Copy `.env.example` to `.env` and set a strong random `API_KEY` (e.g., a 16-digit or 32-character secret):
-```env
-PORT=4848
-API_KEY=replace_with_a_long_random_secret
-ALLOWED_ORIGINS=https://studymedia.aceddivision.com,http://localhost:5173
-HOST=127.0.0.1
-```
-
-### Step 2: Start the Sidecar Server
-```bash
-node server.js
-```
-You should see:
-`StudyMedia sidecar listening on http://127.0.0.1:4848`
-
-### Step 3: Expose Privately with a Quick Cloudflare Tunnel
-In a second terminal:
-```bash
-cloudflared tunnel --url http://127.0.0.1:4848
-```
-Copy the generated `https://xxxx.trycloudflare.com` URL and your `API_KEY` into **StudyMedia → Settings → Home Sidecar & Download Pipeline**, then tap **Test Connection**.
-
----
-
-## Setting Up a Permanent Cloudflare Named Tunnel (Recommended)
-
-Quick `trycloudflare.com` URLs change every time you restart the tunnel. To map a permanent private subdomain (e.g. `https://sidecar.aceddivision.com`):
-
-1. **Authenticate `cloudflared` with your Cloudflare account:**
-   ```bash
-   cloudflared tunnel login
+## PC Setup
+1. Install dependencies and configure `sidecar/.env` (locked to your Windows user via NTFS permissions):
+   ```powershell
+   cd sidecar
+   npm install
    ```
-2. **Create a named tunnel:**
-   ```bash
-   cloudflared tunnel create studymedia-sidecar
+2. Sign into Tailscale on this PC and ensure **MagicDNS** and **HTTPS Certificates** are enabled in the [Tailscale Admin Console → DNS](https://login.tailscale.com/admin/dns).
+3. Run the private Serve script (strictly NO Funnel):
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\setup-tailscale-serve.ps1
    ```
-   Note the `<TUNNEL_ID>` and credentials JSON path printed in the output.
-3. **Create the DNS CNAME route in Cloudflare:**
-   ```bash
-   cloudflared tunnel route dns studymedia-sidecar sidecar.aceddivision.com
-   ```
-4. **Create `~/.cloudflared/config.yml`:**
-   ```yaml
-   tunnel: <TUNNEL_ID>
-   credentials-file: C:\Users\<YOUR_USER>\.cloudflared\<TUNNEL_ID>.json
+   Copy the permanent `https://<pc-name>.<tailnet>.ts.net` URL printed by `tailscale serve status`.
 
-   ingress:
-     - hostname: sidecar.aceddivision.com
-       service: http://127.0.0.1:4848
-     - service: http_status:404
-   ```
-5. **Run the permanent tunnel:**
-   ```bash
-   cloudflared tunnel run studymedia-sidecar
-   ```
-6. Save `https://sidecar.aceddivision.com` + your `API_KEY` in **StudyMedia → Settings**.
+## Phone Setup
+1. Install the official **Tailscale** app from Google Play Store (Android) or App Store (iOS) and sign in with the **same** Tailscale account.
+2. Keep Tailscale toggled **On** whenever you want to pull lectures from your Home Sidecar.
+3. Open **StudyMedia → Settings → Home Sidecar & Download Pipeline**, enter your permanent `https://<pc-name>.<tailnet>.ts.net` URL and your `x-api-key`, tap **Test Connection**, and save.
 
----
-
-## Maintenance Tip
-Keep `yt-dlp` fresh weekly so YouTube changes don't break extractions:
-```bash
+## Maintenance
+Keep `yt-dlp` up to date weekly:
+```powershell
 yt-dlp -U
 ```

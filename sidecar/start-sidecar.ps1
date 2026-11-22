@@ -1,27 +1,33 @@
-# StudyMedia Sidecar Launcher (Localhost-Only + Outbound Cloudflare Tunnel)
-# Run: powershell -ExecutionPolicy Bypass -File .\start-sidecar.ps1
+# StudyMedia Sidecar Watchdog (Localhost-Only 127.0.0.1:4848 for Tailscale Serve)
+# Runs server.js in an auto-restarting loop with zero public ports.
 
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Continue'
 Set-Location $PSScriptRoot
 
-# Refresh PATH in case winget packages were just installed
+# Refresh PATH so yt-dlp and ffmpeg installed via winget are always found
 $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
 
 if (-not (Test-Path '.env')) {
-  Write-Error "Missing sidecar\.env. Copy .env.example to .env and set a strong API_KEY first."
+  Write-Error "Missing sidecar\.env. Copy .env.example to .env and set API_KEY first."
   exit 1
 }
 
-Write-Host "[StudyMedia Sidecar] Starting hardened Express server on 127.0.0.1:4848..." -ForegroundColor Cyan
-$nodeProc = Start-Process -FilePath 'node' -ArgumentList 'server.js' -WorkingDirectory $PSScriptRoot -PassThru -NoNewWindow
+$logFile = Join-Path $PSScriptRoot 'sidecar.log'
 
-Start-Sleep -Seconds 1
-$cfBin = if (Test-Path "$PSScriptRoot\bin\cloudflared.exe") { "$PSScriptRoot\bin\cloudflared.exe" } else { 'cloudflared' }
-Write-Host "[StudyMedia Sidecar] Starting outbound-only Cloudflare Tunnel..." -ForegroundColor Green
-try {
-  & $cfBin tunnel --url http://127.0.0.1:4848
-} finally {
-  if ($nodeProc -and -not $nodeProc.HasExited) {
-    Stop-Process -Id $nodeProc.Id -Force -ErrorAction SilentlyContinue
+while ($true) {
+  $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+  Add-Content -Path $logFile -Value "[$ts] Starting StudyMedia Sidecar on 127.0.0.1:4848..."
+
+  # Trim log file if larger than 2 MB
+  if ((Test-Path $logFile) -and ((Get-Item $logFile).Length -gt 2MB)) {
+    Get-Content $logFile -Tail 200 | Set-Content $logFile
   }
+
+  try {
+    & node server.js *>> $logFile
+  } catch {
+    Add-Content -Path $logFile -Value "[$ts] Process error: $_"
+  }
+
+  Start-Sleep -Seconds 3
 }

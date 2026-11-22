@@ -26,12 +26,34 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .filter(Boolean);
 const EFFECTIVE_ORIGINS = ALLOWED_ORIGINS.length > 0 ? ALLOWED_ORIGINS : DEFAULT_ORIGINS;
 
-// Security headers on every response
+// Defense-in-depth: refuse any TCP connection not originating from local loopback
+// (tailscale serve proxies locally via 127.0.0.1)
+app.use((req, res, next) => {
+  const remote = req.socket?.remoteAddress || '';
+  const isLoopback =
+    remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+  if (!isLoopback) {
+    return res.status(403).json({ error: 'Loopback access only' });
+  }
+  next();
+});
+
+// Security headers on every response + strict Chrome Private Network Access (PNA) for Tailnet
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+
+  const origin = req.headers.origin;
+  if (
+    origin &&
+    EFFECTIVE_ORIGINS.includes(origin) &&
+    req.headers['access-control-request-private-network'] === 'true'
+  ) {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  }
   next();
 });
 
