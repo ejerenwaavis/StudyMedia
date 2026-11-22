@@ -1,6 +1,7 @@
 node_modules/
 client/node_modules/
 sidecar/node_modules/
+sidecar/bin/
 .env
 sidecar/.env
 *.log
