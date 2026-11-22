@@ -98,8 +98,8 @@ export class HTML5Adapter extends MediaAdapter {
     mediaEl.preload = 'metadata';
     mediaEl.controls = false;
     mediaEl.playsInline = true;
-    mediaEl.setAttribute('playsinline', '');
-    mediaEl.setAttribute('webkit-playsinline', '');
+    mediaEl.setAttribute('playsinline', 'true');
+    mediaEl.setAttribute('webkit-playsinline', 'true');
 
     if (isAudio) {
       mediaEl.className = 'hidden';

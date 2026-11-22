@@ -376,7 +376,7 @@ export default function SettingsModal({
 
           <div className="flex items-center justify-between gap-2 pt-2">
             <span className="font-mono text-[10px] text-zinc-500">
-              StudyMedia v2.3 • Nov 22
+              StudyMedia v2.4 • Nov 22
             </span>
             <div className="flex items-center gap-2">
               <button

@@ -24,8 +24,13 @@ import {
   Loader2,
   Server,
   RefreshCw,
+  Hand,
+  ZoomIn,
+  ZoomOut,
+  RotateCcw as ResetIcon,
 } from 'lucide-react';
 import { PlayerController } from '../adapters/PlayerController';
+import { usePinchZoom } from '../hooks/usePinchZoom';
 import { formatTime } from '../utils/youtube';
 import { formatBytes } from '../storage/mediaDB';
 import { getExternalUrl } from '../utils/sourceDetector';
@@ -60,11 +65,13 @@ const VideoPlayer = forwardRef(function VideoPlayer(
   ref
 ) {
   const containerRef = useRef(null);
+  const contentRef = useRef(null);
+  const overlayRef = useRef(null);
   const stageRef = useRef(null);
   const controllerRef = useRef(null);
   const replaceInputRef = useRef(null);
 
-  const [playerState, setPlayerState] = useState('paused'); // 'playing' | 'paused' | 'buffering' | 'ended'
+  const [playerState, setPlayerState] = useState('paused');
   const [currentTime, setCurrentTime] = useState(initialTime || 0);
   const [duration, setDuration] = useState(source?.duration || 0);
   const [controlsVisible, setControlsVisible] = useState(true);
@@ -72,12 +79,18 @@ const VideoPlayer = forwardRef(function VideoPlayer(
   const [copiedUrl, setCopiedUrl] = useState(false);
   const [retryToken, setRetryToken] = useState(0);
 
+  // Fullscreen & Native-Controls Pass-Through State
+  const [isNativeFullscreen, setIsNativeFullscreen] = useState(false);
+  const [isCssFullscreen, setIsCssFullscreen] = useState(false);
+  const [interactMode, setInteractMode] = useState(false);
+
   // 3-Tier Cascade State for Error 101/150
-  const [sidecarHealth, setSidecarHealth] = useState('idle'); // 'idle' | 'checking' | 'online' | 'offline' | 'unconfigured'
-  const [sidecarFormat, setSidecarFormat] = useState('mp4'); // 'mp4' | 'mp3'
+  const [sidecarHealth, setSidecarHealth] = useState('idle');
+  const [sidecarFormat, setSidecarFormat] = useState('mp4');
 
   const fadeTimerRef = useRef(null);
   const isPlaying = playerState === 'playing';
+  const isFullscreen = isNativeFullscreen || isCssFullscreen;
   const isExtracting = Boolean(extractingItemId && source?.id === extractingItemId);
   const sidecarConfigured = Boolean(sidecarUrl?.trim() && sidecarApiKey?.trim());
 
@@ -90,21 +103,102 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     onProgressSave,
   };
 
-  // Auto-fade controls in Theater Mode after 3 seconds of inactivity
+  // Auto-fade controls in Theater or Fullscreen Mode after 3 seconds of inactivity
   const resetFadeTimer = useCallback(() => {
     setControlsVisible(true);
     clearTimeout(fadeTimerRef.current);
-    if (theaterMode) {
+    if (theaterMode || isFullscreen) {
       fadeTimerRef.current = setTimeout(() => {
         setControlsVisible(false);
       }, 3000);
     }
-  }, [theaterMode]);
+  }, [theaterMode, isFullscreen]);
 
   useEffect(() => {
     resetFadeTimer();
     return () => clearTimeout(fadeTimerRef.current);
-  }, [theaterMode, resetFadeTimer]);
+  }, [theaterMode, isFullscreen, resetFadeTimer]);
+
+  // Single-tap handler from usePinchZoom (debounced past double-tap window):
+  // - In Fullscreen or Theater: toggle HUD visibility
+  // - In Study Mode: toggle Play/Pause
+  const handleSingleTap = useCallback(() => {
+    if (isFullscreen || theaterMode) {
+      setControlsVisible((prev) => {
+        const next = !prev;
+        clearTimeout(fadeTimerRef.current);
+        if (next) {
+          fadeTimerRef.current = setTimeout(() => setControlsVisible(false), 3000);
+        }
+        return next;
+      });
+    } else {
+      controllerRef.current?.togglePlay();
+    }
+  }, [isFullscreen, theaterMode]);
+
+  // Pinch-to-Zoom (1x–4x) & Pan Hook (resets cleanly on track switch or fullscreen toggle)
+  const gestureActive = !audioOnlyMode && !playerError && !interactMode;
+  const { zoomLevel, isZoomed, isDragging, zoomIn, zoomOut, resetZoom } = usePinchZoom({
+    stageRef,
+    contentRef,
+    overlayRef,
+    enabled: gestureActive,
+    onSingleTap: handleSingleTap,
+    onActivity: resetFadeTimer,
+    resetKey: `${source?.id || ''}|${isFullscreen}|${audioOnlyMode}`,
+  });
+
+  // Reset interactMode when switching tracks or entering audio-only mode
+  useEffect(() => {
+    setInteractMode(false);
+  }, [source?.id, audioOnlyMode]);
+
+  // Listen to native Fullscreen API changes (Esc / Android back gesture)
+  useEffect(() => {
+    const onFsChange = () => {
+      const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+      const active = Boolean(fsEl && stageRef.current && fsEl === stageRef.current);
+      setIsNativeFullscreen(active);
+      if (!active) {
+        try {
+          window.screen?.orientation?.unlock?.();
+        } catch {
+          // ignore unsupported orientation unlock
+        }
+      }
+    };
+    document.addEventListener('fullscreenchange', onFsChange);
+    document.addEventListener('webkitfullscreenchange', onFsChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onFsChange);
+      document.removeEventListener('webkitfullscreenchange', onFsChange);
+    };
+  }, []);
+
+  // Lock body scroll & listen for Escape when using iOS CSS Fullscreen fallback
+  useEffect(() => {
+    if (!isCssFullscreen) return;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        setIsCssFullscreen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      window.removeEventListener('keydown', onKeyDown);
+      try {
+        window.screen?.orientation?.unlock?.();
+      } catch {
+        // ignore
+      }
+    };
+  }, [isCssFullscreen]);
 
   // Mount & load active source via unified PlayerController
   const sourceKey = source
@@ -120,7 +214,6 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     setCurrentTime(latestPropsRef.current.initialTime || 0);
     setDuration(source.duration || 0);
 
-    // Immediate offline check for non-local sources
     if (!isOnline && !source.isOfflineReady && source.sourceType !== 'local') {
       setPlayerState('paused');
       setPlayerError({
@@ -166,7 +259,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     };
   }, [sourceKey, isOnline]);
 
-  // Tier 1 Auto-Probe: Whenever EMBED_RESTRICTED fires on a YouTube video, check Sidecar health (strict 1.5s timeout)
+  // Tier 1 Auto-Probe on EMBED_RESTRICTED (1.5s timeout)
   useEffect(() => {
     if (playerError?.code !== 'EMBED_RESTRICTED') {
       setSidecarHealth('idle');
@@ -222,13 +315,59 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     },
   }));
 
-  const handleFullscreen = () => {
+  // Fullscreen the Outer Stage (so gesture overlay, pinch-zoom & HUD remain active)
+  // Falls back cleanly to CSS Fullscreen on iOS Safari where div.requestFullscreen is unavailable
+  const handleToggleFullscreen = async () => {
     const el = stageRef.current;
     if (!el) return;
-    if (document.fullscreenElement) {
-      document.exitFullscreen().catch(() => {});
-    } else {
-      el.requestFullscreen?.().catch(() => {});
+
+    // Exit fullscreen if active
+    if (isCssFullscreen) {
+      setIsCssFullscreen(false);
+      try {
+        window.screen?.orientation?.unlock?.();
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+    if (fsEl) {
+      try {
+        if (document.exitFullscreen) {
+          await document.exitFullscreen();
+        } else if (document.webkitExitFullscreen) {
+          await document.webkitExitFullscreen();
+        }
+      } catch {
+        setIsNativeFullscreen(false);
+      }
+      return;
+    }
+
+    // Enter fullscreen on the outer stage container
+    const reqFs = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (typeof reqFs === 'function') {
+      try {
+        await reqFs.call(el);
+        try {
+          await window.screen?.orientation?.lock?.('landscape');
+        } catch {
+          // Orientation lock optional
+        }
+        return;
+      } catch {
+        // Fall through to CSS fullscreen fallback
+      }
+    }
+
+    // iOS Safari / restricted WebView CSS Fullscreen fallback
+    setIsCssFullscreen(true);
+    try {
+      await window.screen?.orientation?.lock?.('landscape');
+    } catch {
+      // Orientation lock optional
     }
   };
 
@@ -264,7 +403,6 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     setTimeout(() => setCopiedUrl(false), 2000);
   };
 
-  // Tier 2: Auto-copy YouTube URL -> show "Link copied!" toast -> open configurable fallback converter
   const handleOpenExternalDownloader = async () => {
     if (externalUrl) {
       await copyTextToClipboard(externalUrl);
@@ -292,14 +430,22 @@ const VideoPlayer = forwardRef(function VideoPlayer(
 
   const progressPct = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
   const isEmbedRestricted = playerError?.code === 'EMBED_RESTRICTED';
+  const showFloatingHud = !audioOnlyMode && !playerError;
+  const showBottomHud = showFloatingHud && (isFullscreen || theaterMode);
 
   return (
     <div
       ref={stageRef}
       onMouseMove={resetFadeTimer}
       onTouchStart={resetFadeTimer}
-      className={`relative w-full overflow-hidden rounded-2xl border border-zinc-800/80 bg-obsidian-900 shadow-2xl transition-all duration-300 ${
-        theaterMode ? 'aspect-[16/9] max-h-[78vh]' : 'aspect-video'
+      className={`overflow-hidden bg-black shadow-2xl transition-all duration-300 ${
+        isCssFullscreen
+          ? 'fixed inset-0 z-50 h-[100dvh] w-screen rounded-none border-0'
+          : isNativeFullscreen
+          ? 'relative h-full w-full rounded-none border-0'
+          : theaterMode
+          ? 'relative aspect-[16/9] max-h-[78vh] w-full rounded-2xl border border-zinc-800/80'
+          : 'relative aspect-video w-full rounded-2xl border border-zinc-800/80'
       }`}
     >
       {/* Hidden local file replacement input */}
@@ -311,19 +457,100 @@ const VideoPlayer = forwardRef(function VideoPlayer(
         className="hidden"
       />
 
-      {/* Unified Adapter Stage Mount (kept mounted in audioOnlyMode so playback continues) */}
+      {/* Inner Transform Wrapper (Pinch-Zoom 1x-4x & Pan target) */}
       <div
-        ref={containerRef}
-        className={`h-full w-full transition-opacity duration-300 ${
+        ref={contentRef}
+        className={`h-full w-full origin-center will-change-transform transition-opacity duration-300 ${
           audioOnlyMode || playerError ? 'pointer-events-none opacity-0' : 'opacity-100'
         }`}
-      />
+      >
+        <div ref={containerRef} className="h-full w-full" />
+      </div>
+
+      {/* Transparent Gesture Overlay (z-10, touch-action: none; switches to pointer-events-none in Interact Mode) */}
+      {showFloatingHud && (
+        <div
+          ref={overlayRef}
+          style={{ touchAction: 'none' }}
+          className={`group absolute inset-0 z-10 flex items-center justify-center transition-colors ${
+            interactMode
+              ? 'pointer-events-none'
+              : isZoomed
+              ? isDragging
+                ? 'cursor-grabbing'
+                : 'cursor-grab'
+              : 'cursor-pointer hover:bg-black/15'
+          }`}
+        >
+          {/* Subtle Center Play/Pause Icon (Study Mode non-fullscreen, non-zoomed, non-interact) */}
+          {!theaterMode && !isFullscreen && !interactMode && !isZoomed && (
+            <div
+              className={`pointer-events-none flex h-16 w-16 items-center justify-center rounded-full bg-black/60 text-white backdrop-blur-md transition-all duration-200 ${
+                isPlaying
+                  ? 'scale-90 opacity-0 group-hover:scale-100 group-hover:opacity-100'
+                  : 'scale-100 opacity-100'
+              }`}
+            >
+              {isPlaying ? <Pause className="h-7 w-7" /> : <Play className="ml-1 h-7 w-7" />}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Top-Right Floating Controls: Zoom HUD Pill & Native Controls "Interact" Escape Hatch (z-20) */}
+      {showFloatingHud && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className={`absolute right-3 top-3 z-20 flex items-center gap-2 transition-opacity duration-300 ${
+            (isFullscreen || theaterMode) && !controlsVisible && !isZoomed && !interactMode
+              ? 'pointer-events-none opacity-0'
+              : 'opacity-100'
+          }`}
+        >
+          {/* Live Zoom Level Pill + One-Tap Reset (visible whenever scale > 1.05) */}
+          {isZoomed && (
+            <div className="flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-black/75 px-2.5 py-1 text-xs font-bold text-amber-300 backdrop-blur-md">
+              <span className="font-mono">{zoomLevel.toFixed(1)}x</span>
+              <button
+                type="button"
+                onClick={() => resetZoom(true)}
+                className="flex items-center gap-1 rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-bold text-amber-200 transition hover:bg-amber-500/35"
+              >
+                <ResetIcon className="h-3 w-3" />
+                Reset
+              </button>
+            </div>
+          )}
+
+          {/* Native Controls Escape Hatch ("Interact" Pass-Through Toggle) */}
+          <button
+            type="button"
+            onClick={() => {
+              setInteractMode((prev) => !prev);
+              resetFadeTimer();
+            }}
+            title={
+              interactMode
+                ? 'Pass-through active: tap to return to Pinch-Zoom & Pan mode'
+                : 'Interact Mode: temporarily pass taps through to YouTube/Vimeo CC, quality & settings'
+            }
+            className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1.5 text-[11px] font-semibold backdrop-blur-md transition ${
+              interactMode
+                ? 'border-amber-400 bg-amber-500 text-black shadow-lg'
+                : 'border-zinc-700/70 bg-black/65 text-zinc-200 hover:border-zinc-500 hover:bg-black/85 hover:text-white'
+            }`}
+          >
+            <Hand className="h-3.5 w-3.5" />
+            <span>{interactMode ? 'Interact ON' : 'Interact'}</span>
+          </button>
+        </div>
+      )}
 
       {/* Audio-Only / Minimal Distraction Overlay */}
       {audioOnlyMode && !playerError && (
         <div
           onClick={() => controllerRef.current?.togglePlay()}
-          className="absolute inset-0 flex cursor-pointer flex-col items-center justify-center bg-gradient-to-br from-obsidian-900 via-obsidian-950 to-zinc-900 p-6 text-center"
+          className="absolute inset-0 z-20 flex cursor-pointer flex-col items-center justify-center bg-gradient-to-br from-obsidian-900 via-obsidian-950 to-zinc-900 p-6 text-center"
         >
           {source?.thumbnail && (
             <img
@@ -340,26 +567,8 @@ const VideoPlayer = forwardRef(function VideoPlayer(
             {source?.title || 'Playing Lecture Audio'}
           </p>
           <p className="mt-1 text-xs text-zinc-400">
-            Video hidden to save battery & reduce distraction • Tap to {isPlaying ? 'pause' : 'play'}
+            Video hidden to save battery &amp; reduce distraction • Tap to {isPlaying ? 'pause' : 'play'}
           </p>
-        </div>
-      )}
-
-      {/* Center Play/Pause Tap Zone (Study Mode) */}
-      {!audioOnlyMode && !theaterMode && !playerError && (
-        <div
-          onClick={() => controllerRef.current?.togglePlay()}
-          className="group absolute inset-0 flex cursor-pointer items-center justify-center bg-black/0 transition-colors hover:bg-black/20"
-        >
-          <div
-            className={`flex h-16 w-16 items-center justify-center rounded-full bg-black/60 text-white backdrop-blur-md transition-all duration-200 ${
-              isPlaying
-                ? 'scale-90 opacity-0 group-hover:scale-100 group-hover:opacity-100'
-                : 'scale-100 opacity-100'
-            }`}
-          >
-            {isPlaying ? <Pause className="h-7 w-7" /> : <Play className="ml-1 h-7 w-7" />}
-          </div>
         </div>
       )}
 
@@ -390,7 +599,6 @@ const VideoPlayer = forwardRef(function VideoPlayer(
               : 'Unable to Play Stream'}
           </h3>
 
-          {/* Sidecar Status Pill (for Error 101/150) */}
           {isEmbedRestricted && source?.sourceType === 'youtube' && (
             <div className="mt-2">
               {sidecarHealth === 'checking' && (
@@ -420,7 +628,6 @@ const VideoPlayer = forwardRef(function VideoPlayer(
             </p>
           )}
 
-          {/* Active Sidecar Extraction / Download Progress Bar */}
           {isExtracting && (
             <div className="mt-3 w-full max-w-sm rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-3 text-left">
               <div className="mb-1.5 flex items-center justify-between text-[11px] font-semibold text-emerald-300">
@@ -451,9 +658,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
             </div>
           )}
 
-          {/* 3-Tier Cascade Action Row */}
           <div className="mt-4 flex flex-wrap items-center justify-center gap-2.5">
-            {/* TIER 1: Home Sidecar Online (Format Toggle + Prominent Fetch Button) */}
             {isEmbedRestricted &&
               source?.sourceType === 'youtube' &&
               sidecarConfigured &&
@@ -501,7 +706,6 @@ const VideoPlayer = forwardRef(function VideoPlayer(
                 </div>
               )}
 
-            {/* TIER 2: Sidecar Offline or Unconfigured -> Open External Downloader (Auto-Copies URL) */}
             {isEmbedRestricted &&
               externalUrl &&
               sidecarHealth !== 'online' &&
@@ -516,7 +720,6 @@ const VideoPlayer = forwardRef(function VideoPlayer(
                 </button>
               )}
 
-            {/* TIER 3: Local Import -> Always right next to Tier 1 / Tier 2 */}
             <button
               type="button"
               onClick={() => replaceInputRef.current?.click()}
@@ -538,7 +741,6 @@ const VideoPlayer = forwardRef(function VideoPlayer(
             )}
           </div>
 
-          {/* Secondary Utility Row: Copy URL & Open in YouTube */}
           {externalUrl && source?.sourceType !== 'local' && (
             <div className="mt-3.5 flex flex-wrap items-center justify-center gap-2 text-[11px] text-zinc-400">
               <button
@@ -573,25 +775,46 @@ const VideoPlayer = forwardRef(function VideoPlayer(
         </div>
       )}
 
-      {/* Fullscreen button (Study Mode bottom-right) */}
-      {!theaterMode && !playerError && (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            handleFullscreen();
-          }}
-          title="Fullscreen"
-          className="absolute bottom-3 right-3 z-10 rounded-lg bg-black/60 p-2 text-zinc-300 backdrop-blur-md transition hover:bg-black/80 hover:text-white"
+      {/* Bottom-Right Zoom & Fullscreen Controls (Study Mode, non-fullscreen, non-theater) */}
+      {showFloatingHud && !theaterMode && !isFullscreen && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="absolute bottom-3 right-3 z-20 flex items-center gap-1.5"
         >
-          <Maximize2 className="h-4 w-4" />
-        </button>
+          <button
+            type="button"
+            onClick={zoomOut}
+            disabled={!isZoomed}
+            title="Zoom Out (Ctrl + Scroll)"
+            className="rounded-lg bg-black/65 p-2 text-zinc-300 backdrop-blur-md transition hover:bg-black/85 hover:text-white disabled:opacity-35"
+          >
+            <ZoomOut className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={zoomIn}
+            disabled={zoomLevel >= 4}
+            title="Zoom In (Ctrl + Scroll or Pinch)"
+            className="rounded-lg bg-black/65 p-2 text-zinc-300 backdrop-blur-md transition hover:bg-black/85 hover:text-white disabled:opacity-35"
+          >
+            <ZoomIn className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={handleToggleFullscreen}
+            title="Fullscreen (keeps Pinch-Zoom & StudyMedia HUD active)"
+            className="rounded-lg bg-black/65 p-2 text-zinc-300 backdrop-blur-md transition hover:bg-black/85 hover:text-white"
+          >
+            <Maximize2 className="h-4 w-4" />
+          </button>
+        </div>
       )}
 
-      {/* Theater Mode Auto-Fading Bottom Overlay */}
-      {theaterMode && !playerError && (
+      {/* Auto-Hiding Bottom HUD for Fullscreen & Theater Modes */}
+      {showBottomHud && (
         <div
-          className={`absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-black/95 via-black/75 to-transparent px-5 pb-4 pt-12 transition-opacity duration-500 ${
+          onClick={(e) => e.stopPropagation()}
+          className={`absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-black/95 via-black/80 to-transparent px-4 pb-4 pt-12 transition-opacity duration-300 sm:px-5 ${
             controlsVisible ? 'opacity-100' : 'pointer-events-none opacity-0'
           }`}
         >
@@ -612,12 +835,13 @@ const VideoPlayer = forwardRef(function VideoPlayer(
                 const val = Number(e.target.value);
                 controllerRef.current?.seekTo(val);
                 setCurrentTime(val);
+                resetFadeTimer();
               }}
               className="study-scrubber absolute inset-0 h-full w-full opacity-0 hover:opacity-100"
             />
           </div>
 
-          <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-2.5">
             <div className="min-w-0 flex-1">
               <p className="truncate text-sm font-semibold text-white">
                 {source?.title || 'Lecture Playing'}
@@ -627,45 +851,141 @@ const VideoPlayer = forwardRef(function VideoPlayer(
               </p>
             </div>
 
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              {/* Scrub Back */}
               <button
                 type="button"
-                onClick={() => controllerRef.current?.seekRelative(-seekInterval)}
-                className="flex items-center gap-1 rounded-full bg-zinc-800/80 px-3 py-1.5 text-xs font-semibold text-zinc-100 hover:bg-zinc-700"
+                onClick={() => {
+                  controllerRef.current?.seekRelative(-seekInterval);
+                  resetFadeTimer();
+                }}
+                className="flex items-center gap-1 rounded-full bg-zinc-800/85 px-2.5 py-1.5 text-xs font-semibold text-zinc-100 hover:bg-zinc-700"
               >
-                <RotateCcw className="h-4 w-4" />
+                <RotateCcw className="h-3.5 w-3.5" />
                 {seekInterval}s
               </button>
 
+              {/* Play / Pause */}
               <button
                 type="button"
-                onClick={() => controllerRef.current?.togglePlay()}
+                onClick={() => {
+                  controllerRef.current?.togglePlay();
+                  resetFadeTimer();
+                }}
                 className="flex h-10 w-10 items-center justify-center rounded-full bg-white text-black transition hover:scale-105"
               >
                 {isPlaying ? <Pause className="h-5 w-5" /> : <Play className="ml-0.5 h-5 w-5" />}
               </button>
 
+              {/* Scrub Forward */}
               <button
                 type="button"
-                onClick={() => controllerRef.current?.seekRelative(seekInterval)}
-                className="flex items-center gap-1 rounded-full bg-zinc-800/80 px-3 py-1.5 text-xs font-semibold text-zinc-100 hover:bg-zinc-700"
+                onClick={() => {
+                  controllerRef.current?.seekRelative(seekInterval);
+                  resetFadeTimer();
+                }}
+                className="flex items-center gap-1 rounded-full bg-zinc-800/85 px-2.5 py-1.5 text-xs font-semibold text-zinc-100 hover:bg-zinc-700"
               >
                 {seekInterval}s
-                <RotateCw className="h-4 w-4" />
+                <RotateCw className="h-3.5 w-3.5" />
               </button>
 
-              <span className="rounded-full border border-zinc-700 bg-zinc-800/90 px-2.5 py-1 font-mono text-xs font-medium text-zinc-200">
+              {/* Zoom Controls (- / Reset / +) */}
+              <div className="flex items-center gap-1 rounded-full border border-zinc-700/80 bg-zinc-900/85 p-0.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    zoomOut();
+                    resetFadeTimer();
+                  }}
+                  disabled={!isZoomed}
+                  title="Zoom Out"
+                  className="rounded-full p-1.5 text-zinc-300 hover:bg-zinc-800 hover:text-white disabled:opacity-35"
+                >
+                  <ZoomOut className="h-3.5 w-3.5" />
+                </button>
+                {isZoomed ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      resetZoom(true);
+                      resetFadeTimer();
+                    }}
+                    title="Reset Zoom to 1x"
+                    className="rounded-full bg-amber-500/20 px-2 py-0.5 font-mono text-[11px] font-bold text-amber-300 hover:bg-amber-500/35"
+                  >
+                    {zoomLevel.toFixed(1)}x
+                  </button>
+                ) : (
+                  <span className="px-1 font-mono text-[11px] text-zinc-400">1.0x</span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    zoomIn();
+                    resetFadeTimer();
+                  }}
+                  disabled={zoomLevel >= 4}
+                  title="Zoom In"
+                  className="rounded-full p-1.5 text-zinc-300 hover:bg-zinc-800 hover:text-white disabled:opacity-35"
+                >
+                  <ZoomIn className="h-3.5 w-3.5" />
+                </button>
+              </div>
+
+              {/* Interact Toggle inside Fullscreen HUD */}
+              <button
+                type="button"
+                onClick={() => {
+                  setInteractMode((prev) => !prev);
+                  resetFadeTimer();
+                }}
+                title="Toggle Native Player Pass-Through"
+                className={`rounded-lg p-2 transition ${
+                  interactMode
+                    ? 'bg-amber-500 text-black'
+                    : 'bg-zinc-800/85 text-zinc-300 hover:bg-zinc-700 hover:text-white'
+                }`}
+              >
+                <Hand className="h-4 w-4" />
+              </button>
+
+              <span className="hidden rounded-full border border-zinc-700 bg-zinc-800/90 px-2.5 py-1 font-mono text-xs font-medium text-zinc-200 sm:inline-block">
                 {playbackSpeed}x
               </span>
 
-              <button
-                type="button"
-                onClick={onExitTheater}
-                title="Exit Theater Mode"
-                className="rounded-lg bg-zinc-800/80 p-2 text-zinc-300 hover:bg-zinc-700 hover:text-white"
-              >
-                <Minimize2 className="h-4 w-4" />
-              </button>
+              {/* Fullscreen Toggle / Exit */}
+              {isFullscreen ? (
+                <button
+                  type="button"
+                  onClick={handleToggleFullscreen}
+                  title="Exit Fullscreen"
+                  className="rounded-lg bg-zinc-800/85 p-2 text-zinc-200 hover:bg-zinc-700 hover:text-white"
+                >
+                  <Minimize2 className="h-4 w-4" />
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={handleToggleFullscreen}
+                    title="Enter Fullscreen"
+                    className="rounded-lg bg-zinc-800/85 p-2 text-zinc-200 hover:bg-zinc-700 hover:text-white"
+                  >
+                    <Maximize2 className="h-4 w-4" />
+                  </button>
+                  {theaterMode && onExitTheater && (
+                    <button
+                      type="button"
+                      onClick={onExitTheater}
+                      title="Exit Theater Mode"
+                      className="rounded-lg bg-zinc-800/85 p-2 text-zinc-300 hover:bg-zinc-700 hover:text-white"
+                    >
+                      <Minimize2 className="h-4 w-4" />
+                    </button>
+                  )}
+                </>
+              )}
             </div>
           </div>
         </div>
