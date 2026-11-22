@@ -7,12 +7,11 @@ import {
   SkipBack,
   SkipForward,
   Radio,
-  Gauge,
 } from 'lucide-react';
 import { formatTime } from '../utils/youtube';
+import SpeedPopover from './SpeedPopover';
 
 const INTERVAL_PRESETS = [5, 10, 15, 30, 60];
-const SPEED_OPTIONS = [0.75, 1, 1.25, 1.5, 1.75, 2];
 
 export default function CarControlDeck({
   title,
@@ -119,18 +118,12 @@ export default function CarControlDeck({
           <SkipForward className="h-4 w-4" />
         </button>
 
-        <button
-          type="button"
-          onClick={() => {
-            const idx = SPEED_OPTIONS.indexOf(playbackSpeed);
-            const nextSpeed = SPEED_OPTIONS[(idx + 1) % SPEED_OPTIONS.length];
-            onChangeSpeed(nextSpeed);
-          }}
-          className="col-span-2 flex h-14 items-center justify-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 font-mono text-sm font-bold text-amber-400 transition hover:bg-amber-500/20 sm:col-span-1"
-        >
-          <Gauge className="h-4 w-4" />
-          Speed: {playbackSpeed}x
-        </button>
+        <SpeedPopover
+          speed={playbackSpeed}
+          variant="car"
+          align="right"
+          onSelectSpeed={onChangeSpeed}
+        />
       </div>
 
       {/* Quick Interval Pills */}

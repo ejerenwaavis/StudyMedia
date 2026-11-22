@@ -26,6 +26,7 @@ export default function SettingsModal({
   seekInterval,
   doubleTapToSkip,
   doubleTapWindow,
+  autoPlayNext = true,
   workspaceId,
   dbConnected,
   sidecarUrl = '',
@@ -37,6 +38,7 @@ export default function SettingsModal({
   const [customInterval, setCustomInterval] = useState(String(seekInterval));
   const [dtEnabled, setDtEnabled] = useState(doubleTapToSkip);
   const [dtWindow, setDtWindow] = useState(doubleTapWindow);
+  const [autoNext, setAutoNext] = useState(autoPlayNext);
   const [wsId, setWsId] = useState(workspaceId);
   const [scUrl, setScUrl] = useState(sidecarUrl);
   const [scKey, setScKey] = useState(sidecarApiKey);
@@ -59,6 +61,7 @@ export default function SettingsModal({
     setCustomInterval(String(seekInterval));
     setDtEnabled(doubleTapToSkip);
     setDtWindow(doubleTapWindow);
+    setAutoNext(autoPlayNext);
     setWsId(workspaceId);
     setScUrl(sidecarUrl);
     setScKey(sidecarApiKey);
@@ -71,6 +74,7 @@ export default function SettingsModal({
     seekInterval,
     doubleTapToSkip,
     doubleTapWindow,
+    autoPlayNext,
     workspaceId,
     sidecarUrl,
     sidecarApiKey,
@@ -87,6 +91,7 @@ export default function SettingsModal({
       seekInterval: parsedInterval,
       doubleTapToSkip: dtEnabled,
       doubleTapWindow: dtWindow,
+      autoPlayNext: autoNext,
       workspaceId: wsId.trim() || 'default',
       sidecarUrl: scUrl.trim(),
       sidecarApiKey: scKey.trim(),
@@ -154,15 +159,35 @@ export default function SettingsModal({
             />
           </div>
 
-          {/* Double-Tap to Skip */}
+          {/* Auto-Play Next Lecture */}
           <div className="rounded-xl border border-zinc-800 bg-obsidian-950 p-3.5">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-3">
               <div>
                 <p className="text-sm font-semibold text-zinc-200">
-                  Double-tap hardware button to skip video
+                  Auto-play next lecture in playlist
                 </p>
                 <p className="text-xs text-zinc-500">
-                  Single tap scrubs ±{customInterval || 15}s; quick double-tap changes lecture
+                  Automatically advances when a lecture finishes (skips online items when offline)
+                </p>
+              </div>
+              <input
+                type="checkbox"
+                checked={autoNext}
+                onChange={(e) => setAutoNext(e.target.checked)}
+                className="h-4 w-4 accent-amber-500"
+              />
+            </div>
+          </div>
+
+          {/* Double-Tap to Skip */}
+          <div className="rounded-xl border border-zinc-800 bg-obsidian-950 p-3.5">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-zinc-200">
+                  Double-tap hardware button to skip track
+                </p>
+                <p className="text-xs text-zinc-500">
+                  Off (default): every tap immediately seeks ±{customInterval || 15}s so rapid taps stack cleanly
                 </p>
               </div>
               <input
@@ -376,7 +401,7 @@ export default function SettingsModal({
 
           <div className="flex items-center justify-between gap-2 pt-2">
             <span className="font-mono text-[10px] text-zinc-500">
-              StudyMedia v2.5 • Nov 22
+              StudyMedia v2.6 • Nov 22
             </span>
             <div className="flex items-center gap-2">
               <button

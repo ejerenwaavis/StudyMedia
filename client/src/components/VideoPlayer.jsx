@@ -28,7 +28,10 @@ import {
   ZoomIn,
   ZoomOut,
   RotateCcw as ResetIcon,
+  SkipBack,
+  SkipForward,
 } from 'lucide-react';
+import SpeedPopover from './SpeedPopover';
 import { PlayerController } from '../adapters/PlayerController';
 import { usePinchZoom } from '../hooks/usePinchZoom';
 import { formatTime } from '../utils/youtube';
@@ -54,9 +57,15 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     fallbackConverterUrl = DEFAULT_FALLBACK_CONVERTER_URL,
     extractingItemId = null,
     extractProgress = null,
+    hasPrevTrack = false,
+    hasNextTrack = false,
     onStateChange,
     onTimeUpdate,
     onProgressSave,
+    onEnded,
+    onPrevTrack,
+    onNextTrack,
+    onChangeSpeed,
     onExitTheater,
     onReplaceWithLocalFile,
     onFetchViaSidecar,
@@ -83,6 +92,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
   const [isNativeFullscreen, setIsNativeFullscreen] = useState(false);
   const [isCssFullscreen, setIsCssFullscreen] = useState(false);
   const [interactMode, setInteractMode] = useState(false);
+  const [speedMenuOpen, setSpeedMenuOpen] = useState(false);
 
   // 3-Tier Cascade State for Error 101/150
   const [sidecarHealth, setSidecarHealth] = useState('idle');
@@ -98,6 +108,8 @@ const VideoPlayer = forwardRef(function VideoPlayer(
   hudVisibleRef.current = hudVisible;
   const isPlayingRef = useRef(isPlaying);
   isPlayingRef.current = isPlaying;
+  const speedMenuOpenRef = useRef(speedMenuOpen);
+  speedMenuOpenRef.current = speedMenuOpen;
 
   const latestPropsRef = useRef({});
   latestPropsRef.current = {
@@ -106,24 +118,41 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     onStateChange,
     onTimeUpdate,
     onProgressSave,
+    onEnded,
   };
 
-  // Single canonical helper to show HUD and schedule 3.5s auto-hide (while playing)
+  // Single canonical helper to show HUD and schedule 3.5s auto-hide (while playing & speed menu closed)
   const showHud = useCallback(
     (durationMs = 3500) => {
       setHudVisible(true);
       clearTimeout(hudTimerRef.current);
       hudTimerRef.current = null;
-      if (theaterMode || isFullscreen) {
+      if ((theaterMode || isFullscreen) && !speedMenuOpenRef.current) {
         hudTimerRef.current = setTimeout(() => {
           hudTimerRef.current = null;
-          if (isPlayingRef.current) {
+          if (isPlayingRef.current && !speedMenuOpenRef.current) {
             setHudVisible(false);
           }
         }, durationMs);
       }
     },
     [theaterMode, isFullscreen]
+  );
+
+  // Pause 3.5s HUD auto-hide while the speed popover is open; resume when closed
+  const handleSpeedMenuOpenChange = useCallback(
+    (isOpen) => {
+      speedMenuOpenRef.current = isOpen;
+      setSpeedMenuOpen(isOpen);
+      if (isOpen) {
+        clearTimeout(hudTimerRef.current);
+        hudTimerRef.current = null;
+        setHudVisible(true);
+      } else {
+        showHud(3500);
+      }
+    },
+    [showHud]
   );
 
   const hideHud = useCallback(() => {
@@ -268,6 +297,9 @@ const VideoPlayer = forwardRef(function VideoPlayer(
       },
       onProgressSave: (cur, dur) => {
         latestPropsRef.current.onProgressSave?.(cur, dur);
+      },
+      onEnded: () => {
+        latestPropsRef.current.onEnded?.();
       },
       onError: (err) => {
         setPlayerState('paused');
@@ -906,6 +938,22 @@ const VideoPlayer = forwardRef(function VideoPlayer(
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
+              {/* Previous Track */}
+              <button
+                type="button"
+                disabled={!hasPrevTrack}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  showHud(3500);
+                  onPrevTrack?.();
+                }}
+                title="Previous Lecture"
+                aria-label="Previous Lecture"
+                className="rounded-full border border-white/10 bg-black/45 p-2 text-zinc-100 transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <SkipBack className="h-4 w-4" />
+              </button>
+
               {/* Scrub Back */}
               <button
                 type="button"
@@ -942,6 +990,22 @@ const VideoPlayer = forwardRef(function VideoPlayer(
               >
                 {seekInterval}s
                 <RotateCw className="h-3.5 w-3.5" />
+              </button>
+
+              {/* Next Track */}
+              <button
+                type="button"
+                disabled={!hasNextTrack}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  showHud(3500);
+                  onNextTrack?.();
+                }}
+                title="Next Lecture"
+                aria-label="Next Lecture"
+                className="rounded-full border border-white/10 bg-black/45 p-2 text-zinc-100 transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <SkipForward className="h-4 w-4" />
               </button>
 
               {/* Zoom Controls (- / Reset / +) */}
@@ -1004,9 +1068,18 @@ const VideoPlayer = forwardRef(function VideoPlayer(
                 <Hand className="h-4 w-4" />
               </button>
 
-              <span className="hidden rounded-full border border-white/10 bg-black/45 px-2.5 py-1 font-mono text-xs font-medium text-zinc-200 sm:inline-block">
-                {playbackSpeed}x
-              </span>
+              {/* Direct-Select Speed Popover (opens upward; pauses HUD auto-hide while open) */}
+              <SpeedPopover
+                speed={playbackSpeed}
+                variant="hud"
+                align="right"
+                onOpenChange={handleSpeedMenuOpenChange}
+                onSelectSpeed={(rate) => {
+                  controllerRef.current?.setPlaybackRate(rate);
+                  onChangeSpeed?.(rate);
+                  showHud(3500);
+                }}
+              />
 
               {/* Fullscreen Toggle / Exit */}
               {isFullscreen ? (

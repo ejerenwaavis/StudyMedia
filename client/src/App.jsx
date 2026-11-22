@@ -33,6 +33,7 @@ import VideoPlayer from './components/VideoPlayer';
 import QueuePanel from './components/QueuePanel';
 import CarControlDeck from './components/CarControlDeck';
 import SettingsModal from './components/SettingsModal';
+import SpeedPopover from './components/SpeedPopover';
 import { useMediaSession } from './hooks/useMediaSession';
 import { useWakeLock } from './hooks/useWakeLock';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
@@ -62,7 +63,6 @@ import { SequentialPlaylistDownloader } from './utils/playlistDownloader';
 const STORAGE_KEY = 'studymedia_state_v1';
 const DEFAULT_PLAYLIST_ID = 'default';
 const INTERVAL_PRESETS = [5, 10, 15, 30, 60];
-const SPEED_OPTIONS = [0.75, 1, 1.25, 1.5, 1.75, 2];
 
 function createDefaultPlaylist(items = []) {
   return {
@@ -167,9 +167,12 @@ export default function App() {
   const [seekInterval, setSeekInterval] = useState(initialLocal?.seekInterval || 15);
   const [playbackSpeed, setPlaybackSpeed] = useState(initialLocal?.playbackSpeed || 1.25);
   const [doubleTapToSkip, setDoubleTapToSkip] = useState(
-    initialLocal?.doubleTapToSkip !== undefined ? initialLocal.doubleTapToSkip : true
+    initialLocal?.doubleTapToSkip !== undefined ? Boolean(initialLocal.doubleTapToSkip) : false
   );
   const [doubleTapWindow, setDoubleTapWindow] = useState(initialLocal?.doubleTapWindow || 450);
+  const [autoPlayNext, setAutoPlayNext] = useState(
+    initialLocal?.autoPlayNext !== undefined ? Boolean(initialLocal.autoPlayNext) : true
+  );
   const [audioOnlyMode, setAudioOnlyMode] = useState(initialLocal?.audioOnlyMode || false);
 
   const [sidecarUrl, setSidecarUrl] = useState(initialSidecar.sidecarUrl);
@@ -317,6 +320,7 @@ export default function App() {
           playbackSpeed,
           doubleTapToSkip,
           doubleTapWindow,
+          autoPlayNext,
           audioOnlyMode,
         })
       );
@@ -334,6 +338,7 @@ export default function App() {
     playbackSpeed,
     doubleTapToSkip,
     doubleTapWindow,
+    autoPlayNext,
     audioOnlyMode,
   ]);
 
@@ -372,8 +377,10 @@ export default function App() {
           if (data.settings.seekInterval) setSeekInterval(data.settings.seekInterval);
           if (data.settings.playbackSpeed) setPlaybackSpeed(data.settings.playbackSpeed);
           if (data.settings.doubleTapToSkip !== undefined)
-            setDoubleTapToSkip(data.settings.doubleTapToSkip);
+            setDoubleTapToSkip(Boolean(data.settings.doubleTapToSkip));
           if (data.settings.doubleTapWindow) setDoubleTapWindow(data.settings.doubleTapWindow);
+          if (data.settings.autoPlayNext !== undefined)
+            setAutoPlayNext(Boolean(data.settings.autoPlayNext));
           if (data.settings.activeMode) setMode(data.settings.activeMode);
           if (data.settings.activeVideoId && !activeItemId)
             setActiveItemId(data.settings.activeVideoId);
@@ -484,40 +491,74 @@ export default function App() {
     [workspaceId, isOnline]
   );
 
-  // Navigation between lectures in the active playing playlist (respects offline mode)
+  // Playable track list & Prev/Next boundary flags (skips online-only items when offline)
+  const playableTrackList = useMemo(() => {
+    if (playingPlaylistItems.length === 0) return [];
+    if (isOnline) return playingPlaylistItems;
+    return playingPlaylistItems.filter((i) => i.isOfflineReady);
+  }, [playingPlaylistItems, isOnline]);
+
+  const currentTrackIndex = useMemo(
+    () => playableTrackList.findIndex((i) => i.id === activeItemId),
+    [playableTrackList, activeItemId]
+  );
+
+  const hasPrevTrack = currentTrackIndex > 0;
+  const hasNextTrack =
+    currentTrackIndex >= 0 && currentTrackIndex < playableTrackList.length - 1;
+
+  // Navigation between lectures in the active playing playlist (respects offline mode & bounds)
   const handleNextTrack = useCallback(() => {
-    if (playingPlaylistItems.length === 0) return;
-    const playable = isOnline
-      ? playingPlaylistItems
-      : playingPlaylistItems.filter((i) => i.isOfflineReady);
-    const list = playable.length > 0 ? playable : playingPlaylistItems;
-    const curIdx = list.findIndex((i) => i.id === activeItemId);
-    const nextIdx = curIdx >= 0 ? (curIdx + 1) % list.length : 0;
-    const next = list[nextIdx];
+    if (playableTrackList.length === 0) return;
+    if (currentTrackIndex < 0) {
+      const first = playableTrackList[0];
+      if (first) {
+        setActiveItemId(first.id);
+        if (first.sourceType !== 'local') syncSettingsToServer({ activeVideoId: first.id });
+      }
+      return;
+    }
+    if (currentTrackIndex >= playableTrackList.length - 1) return;
+    const next = playableTrackList[currentTrackIndex + 1];
     if (next) {
       setActiveItemId(next.id);
       if (next.sourceType !== 'local') {
         syncSettingsToServer({ activeVideoId: next.id });
       }
     }
-  }, [playingPlaylistItems, isOnline, activeItemId, syncSettingsToServer]);
+  }, [playableTrackList, currentTrackIndex, syncSettingsToServer]);
 
   const handlePrevTrack = useCallback(() => {
-    if (playingPlaylistItems.length === 0) return;
-    const playable = isOnline
-      ? playingPlaylistItems
-      : playingPlaylistItems.filter((i) => i.isOfflineReady);
-    const list = playable.length > 0 ? playable : playingPlaylistItems;
-    const curIdx = list.findIndex((i) => i.id === activeItemId);
-    const prevIdx = curIdx > 0 ? curIdx - 1 : Math.max(0, list.length - 1);
-    const prev = list[prevIdx];
+    if (playableTrackList.length === 0 || currentTrackIndex <= 0) return;
+    const prev = playableTrackList[currentTrackIndex - 1];
     if (prev) {
       setActiveItemId(prev.id);
       if (prev.sourceType !== 'local') {
         syncSettingsToServer({ activeVideoId: prev.id });
       }
     }
-  }, [playingPlaylistItems, isOnline, activeItemId, syncSettingsToServer]);
+  }, [playableTrackList, currentTrackIndex, syncSettingsToServer]);
+
+  // Auto-advance strictly to the next playable item when a video ends (keeps fullscreen active)
+  const handleAutoAdvance = useCallback(() => {
+    if (!autoPlayNext) return;
+    if (playingPlaylistItems.length === 0) return;
+
+    const rawIdx = playingPlaylistItems.findIndex((i) => i.id === activeItemId);
+    if (rawIdx < 0) return;
+
+    // Scan forward from the finished lecture; skip online-only items when offline
+    for (let i = rawIdx + 1; i < playingPlaylistItems.length; i++) {
+      const candidate = playingPlaylistItems[i];
+      if (isOnline || candidate.isOfflineReady) {
+        setActiveItemId(candidate.id);
+        if (candidate.sourceType !== 'local') {
+          syncSettingsToServer({ activeVideoId: candidate.id });
+        }
+        return;
+      }
+    }
+  }, [autoPlayNext, playingPlaylistItems, activeItemId, isOnline, syncSettingsToServer]);
 
   const seekIntervalRef = useRef(seekInterval);
   seekIntervalRef.current = seekInterval;
@@ -1275,15 +1316,9 @@ export default function App() {
     showNotice('Cleared all offline media blobs from IndexedDB.', 'info');
   };
 
-  const handlePlayerStateChange = useCallback(
-    (playing, canonicalState) => {
-      setIsPlaying(playing);
-      if (canonicalState === 'ended' && playingPlaylistItems.length > 1) {
-        handleNextTrack();
-      }
-    },
-    [playingPlaylistItems.length, handleNextTrack]
-  );
+  const handlePlayerStateChange = useCallback((playing) => {
+    setIsPlaying(playing);
+  }, []);
 
   const handleCycleInterval = () => {
     const idx = INTERVAL_PRESETS.indexOf(seekInterval);
@@ -1292,12 +1327,13 @@ export default function App() {
     syncSettingsToServer({ seekInterval: next });
   };
 
-  const handleCycleSpeed = () => {
-    const idx = SPEED_OPTIONS.indexOf(playbackSpeed);
-    const next = SPEED_OPTIONS[(idx + 1) % SPEED_OPTIONS.length];
-    setPlaybackSpeed(next);
-    syncSettingsToServer({ playbackSpeed: next });
-  };
+  const handleSelectSpeed = useCallback(
+    (rate) => {
+      setPlaybackSpeed(rate);
+      syncSettingsToServer({ playbackSpeed: rate });
+    },
+    [syncSettingsToServer]
+  );
 
   const handleModeChange = (nextMode) => {
     setMode(nextMode);
@@ -1673,7 +1709,13 @@ export default function App() {
                 fallbackConverterUrl={fallbackConverterUrl}
                 extractingItemId={extractingItemId}
                 extractProgress={extractProgress}
+                hasPrevTrack={hasPrevTrack}
+                hasNextTrack={hasNextTrack}
                 onStateChange={handlePlayerStateChange}
+                onEnded={handleAutoAdvance}
+                onPrevTrack={handlePrevTrack}
+                onNextTrack={handleNextTrack}
+                onChangeSpeed={handleSelectSpeed}
                 onTimeUpdate={(cur, dur) => {
                   setCurrentTime(cur);
                   if (dur > 0) setDuration(dur);
@@ -1713,7 +1755,13 @@ export default function App() {
                   fallbackConverterUrl={fallbackConverterUrl}
                   extractingItemId={extractingItemId}
                   extractProgress={extractProgress}
+                  hasPrevTrack={hasPrevTrack}
+                  hasNextTrack={hasNextTrack}
                   onStateChange={handlePlayerStateChange}
+                  onEnded={handleAutoAdvance}
+                  onPrevTrack={handlePrevTrack}
+                  onNextTrack={handleNextTrack}
+                  onChangeSpeed={handleSelectSpeed}
                   onTimeUpdate={(cur, dur) => {
                     setCurrentTime(cur);
                     if (dur > 0) setDuration(dur);
@@ -1774,7 +1822,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={handlePrevTrack}
-                      disabled={playingPlaylistItems.length < 2}
+                      disabled={!hasPrevTrack}
                       title="Previous Lecture"
                       className="rounded-full p-2 text-zinc-400 transition hover:bg-obsidian-800 hover:text-white disabled:opacity-30"
                     >
@@ -1816,7 +1864,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={handleNextTrack}
-                      disabled={playingPlaylistItems.length < 2}
+                      disabled={!hasNextTrack}
                       title="Next Lecture"
                       className="rounded-full p-2 text-zinc-400 transition hover:bg-obsidian-800 hover:text-white disabled:opacity-30"
                     >
@@ -1834,14 +1882,12 @@ export default function App() {
                       {seekInterval}s
                     </button>
 
-                    <button
-                      type="button"
-                      onClick={handleCycleSpeed}
-                      title="Click to cycle playback speed"
-                      className="rounded-full border border-zinc-700 bg-obsidian-800 px-3.5 py-1.5 font-mono text-xs font-semibold text-zinc-200 transition hover:border-zinc-600 hover:text-white"
-                    >
-                      {playbackSpeed}x
-                    </button>
+                    <SpeedPopover
+                      speed={playbackSpeed}
+                      variant="study"
+                      align="right"
+                      onSelectSpeed={handleSelectSpeed}
+                    />
 
                     <button
                       type="button"
@@ -1879,8 +1925,8 @@ export default function App() {
                 duration={duration}
                 seekInterval={seekInterval}
                 playbackSpeed={playbackSpeed}
-                hasPrev={playingPlaylistItems.length > 1}
-                hasNext={playingPlaylistItems.length > 1}
+                hasPrev={hasPrevTrack}
+                hasNext={hasNextTrack}
                 lastSignal={lastSignal}
                 onTogglePlay={handleTogglePlay}
                 onSeekRelative={handleSeekRelative}
@@ -1890,10 +1936,7 @@ export default function App() {
                   setSeekInterval(sec);
                   syncSettingsToServer({ seekInterval: sec });
                 }}
-                onChangeSpeed={(spd) => {
-                  setPlaybackSpeed(spd);
-                  syncSettingsToServer({ playbackSpeed: spd });
-                }}
+                onChangeSpeed={handleSelectSpeed}
                 onTestSignal={triggerTestSignal}
               />
 
@@ -1914,7 +1957,13 @@ export default function App() {
                     fallbackConverterUrl={fallbackConverterUrl}
                     extractingItemId={extractingItemId}
                     extractProgress={extractProgress}
+                    hasPrevTrack={hasPrevTrack}
+                    hasNextTrack={hasNextTrack}
                     onStateChange={handlePlayerStateChange}
+                    onEnded={handleAutoAdvance}
+                    onPrevTrack={handlePrevTrack}
+                    onNextTrack={handleNextTrack}
+                    onChangeSpeed={handleSelectSpeed}
                     onTimeUpdate={(cur, dur) => {
                       setCurrentTime(cur);
                       if (dur > 0) setDuration(dur);
@@ -1971,6 +2020,7 @@ export default function App() {
         seekInterval={seekInterval}
         doubleTapToSkip={doubleTapToSkip}
         doubleTapWindow={doubleTapWindow}
+        autoPlayNext={autoPlayNext}
         workspaceId={workspaceId}
         dbConnected={dbConnected}
         sidecarUrl={sidecarUrl}
@@ -1981,6 +2031,7 @@ export default function App() {
           setSeekInterval(next.seekInterval);
           setDoubleTapToSkip(next.doubleTapToSkip);
           setDoubleTapWindow(next.doubleTapWindow);
+          setAutoPlayNext(next.autoPlayNext);
           setWorkspaceId(next.workspaceId);
           setSidecarUrl(next.sidecarUrl || '');
           setSidecarApiKey(next.sidecarApiKey || '');
@@ -1989,6 +2040,7 @@ export default function App() {
             seekInterval: next.seekInterval,
             doubleTapToSkip: next.doubleTapToSkip,
             doubleTapWindow: next.doubleTapWindow,
+            autoPlayNext: next.autoPlayNext,
             workspaceId: next.workspaceId,
             sidecarUrl: next.sidecarUrl || '',
             sidecarApiKey: next.sidecarApiKey || '',

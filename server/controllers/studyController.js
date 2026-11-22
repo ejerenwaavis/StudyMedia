@@ -369,6 +369,7 @@ exports.updateSettings = async (req, res) => {
       'playbackSpeed',
       'doubleTapToSkip',
       'doubleTapWindow',
+      'autoPlayNext',
       'audioOnlyMode',
       'wakeLockPreferred',
       'activeMode',

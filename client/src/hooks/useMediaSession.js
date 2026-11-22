@@ -52,7 +52,7 @@ export function useMediaSession({
   playbackSpeed = 1,
   duration,
   currentTime,
-  doubleTapToSkip = true,
+  doubleTapToSkip = false,
   doubleTapWindow = 450,
   onSeekRelative,
   onSeekTo,
@@ -207,53 +207,60 @@ export function useMediaSession({
   useEffect(() => {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
 
-    const handlePrevTrack = () => {
+    // Symmetric double-tap vs immediate seek-only handler for BOTH previoustrack and nexttrack
+    const createTrackButtonHandler = (direction) => () => {
+      const isPrev = direction === 'prev';
+      const timerRef = isPrev ? prevTapTimerRef : nextTapTimerRef;
+      const otherTimerRef = isPrev ? nextTapTimerRef : prevTapTimerRef;
+
+      // Clear opposite direction pending timer if user reverses direction quickly
+      if (otherTimerRef.current) {
+        clearTimeout(otherTimerRef.current);
+        otherTimerRef.current = null;
+      }
+
+      // Seek-Only Mode (Default): zero delay, feeds directly into PlayerController's optimistic accumulator
       if (!doubleTapEnabledRef.current) {
         const liveInterval = seekIntervalRef.current;
-        emitSignal('previoustrack', `Rewind -${liveInterval}s`);
-        callbacksRef.current.onSeekRelative?.(-liveInterval);
+        const delta = isPrev ? -liveInterval : liveInterval;
+        emitSignal(
+          isPrev ? 'previoustrack' : 'nexttrack',
+          isPrev ? `Rewind -${liveInterval}s` : `Forward +${liveInterval}s`
+        );
+        callbacksRef.current.onSeekRelative?.(delta);
         return;
       }
 
-      if (prevTapTimerRef.current) {
-        clearTimeout(prevTapTimerRef.current);
-        prevTapTimerRef.current = null;
-        emitSignal('double-tap-prev', 'Previous Lecture in Queue');
-        callbacksRef.current.onPrevTrack?.();
+      // Double-Tap Skip Mode (Opt-in): symmetric double-tap window for both Back and Forward
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+        emitSignal(
+          isPrev ? 'double-tap-prev' : 'double-tap-next',
+          isPrev ? 'Previous Lecture in Queue' : 'Next Lecture in Queue'
+        );
+        if (isPrev) {
+          callbacksRef.current.onPrevTrack?.();
+        } else {
+          callbacksRef.current.onNextTrack?.();
+        }
       } else {
         const windowMs = doubleTapWindowRef.current;
-        prevTapTimerRef.current = setTimeout(() => {
-          prevTapTimerRef.current = null;
+        timerRef.current = setTimeout(() => {
+          timerRef.current = null;
           const liveInterval = seekIntervalRef.current;
-          emitSignal('previoustrack', `Rewind -${liveInterval}s`);
-          callbacksRef.current.onSeekRelative?.(-liveInterval);
+          const delta = isPrev ? -liveInterval : liveInterval;
+          emitSignal(
+            isPrev ? 'previoustrack' : 'nexttrack',
+            isPrev ? `Rewind -${liveInterval}s` : `Forward +${liveInterval}s`
+          );
+          callbacksRef.current.onSeekRelative?.(delta);
         }, windowMs);
       }
     };
 
-    const handleNextTrack = () => {
-      if (!doubleTapEnabledRef.current) {
-        const liveInterval = seekIntervalRef.current;
-        emitSignal('nexttrack', `Forward +${liveInterval}s`);
-        callbacksRef.current.onSeekRelative?.(liveInterval);
-        return;
-      }
-
-      if (nextTapTimerRef.current) {
-        clearTimeout(nextTapTimerRef.current);
-        nextTapTimerRef.current = null;
-        emitSignal('double-tap-next', 'Next Lecture in Queue');
-        callbacksRef.current.onNextTrack?.();
-      } else {
-        const windowMs = doubleTapWindowRef.current;
-        nextTapTimerRef.current = setTimeout(() => {
-          nextTapTimerRef.current = null;
-          const liveInterval = seekIntervalRef.current;
-          emitSignal('nexttrack', `Forward +${liveInterval}s`);
-          callbacksRef.current.onSeekRelative?.(liveInterval);
-        }, windowMs);
-      }
-    };
+    const handlePrevTrack = createTrackButtonHandler('prev');
+    const handleNextTrack = createTrackButtonHandler('next');
 
     // Always honor the user's live seekIntervalRef (never let OS/browser default 5s seekOffset override it)
     const handleSeekBackward = () => {

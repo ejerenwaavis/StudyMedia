@@ -20,6 +20,10 @@ const userSettingsSchema = new mongoose.Schema(
     },
     doubleTapToSkip: {
       type: Boolean,
+      default: false,
+    },
+    autoPlayNext: {
+      type: Boolean,
       default: true,
     },
     doubleTapWindow: {

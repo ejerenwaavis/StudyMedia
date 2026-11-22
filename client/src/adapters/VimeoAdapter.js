@@ -78,6 +78,7 @@ export class VimeoAdapter extends MediaAdapter {
       if (!this.destroyed) {
         this.callbacks.onReady();
         this.callbacks.onTimeUpdate(this._currentTime, this._duration);
+        this.player.play().catch(() => {});
       }
     });
 

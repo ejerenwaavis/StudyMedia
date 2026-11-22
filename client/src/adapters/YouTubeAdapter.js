@@ -137,6 +137,12 @@ export class YouTubeAdapter extends MediaAdapter {
           this.callbacks.onReady();
           this.callbacks.onTimeUpdate(this.getCurrentTime(), dur);
           this._startPolling();
+
+          try {
+            player.playVideo?.();
+          } catch {
+            // ignore autoplay gesture blocks
+          }
         },
         onStateChange: (event) => {
           if (this.destroyed) return;
@@ -144,13 +150,18 @@ export class YouTubeAdapter extends MediaAdapter {
           const cur = this.getCurrentTime();
           const dur = this.getDuration();
 
-          if (state === YT.PlayerState.PLAYING) {
+          const PLAYING = YT.PlayerState?.PLAYING ?? 1;
+          const PAUSED = YT.PlayerState?.PAUSED ?? 2;
+          const BUFFERING = YT.PlayerState?.BUFFERING ?? 3;
+          const ENDED = YT.PlayerState?.ENDED ?? 0;
+
+          if (state === PLAYING) {
             this.callbacks.onStateChange('playing');
-          } else if (state === YT.PlayerState.PAUSED) {
+          } else if (state === PAUSED) {
             this.callbacks.onStateChange('paused');
-          } else if (state === YT.PlayerState.BUFFERING) {
+          } else if (state === BUFFERING) {
             this.callbacks.onStateChange('buffering');
-          } else if (state === YT.PlayerState.ENDED) {
+          } else if (state === ENDED) {
             this.callbacks.onStateChange('ended');
           }
 

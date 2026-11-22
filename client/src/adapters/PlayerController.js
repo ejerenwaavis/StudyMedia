@@ -18,11 +18,13 @@ export class PlayerController {
       onTimeUpdate: callbacks.onTimeUpdate || (() => {}),
       onError: callbacks.onError || (() => {}),
       onProgressSave: callbacks.onProgressSave || (() => {}),
+      onEnded: callbacks.onEnded || (() => {}),
     };
     this.adapter = null;
     this.currentSource = null;
     this.state = 'paused'; // 'playing' | 'paused' | 'buffering' | 'ended'
     this.lastSavedAt = 0;
+    this.hasEmittedEnded = false;
 
     // Optimistic seek accumulation state for rapid repeated hardware/UI taps
     this.pendingSeekTarget = null;
@@ -55,6 +57,7 @@ export class PlayerController {
     this.currentSource = source;
     this.state = 'buffering';
     this.lastSavedAt = Date.now();
+    this.hasEmittedEnded = false;
     this._resetPendingSeek();
 
     const adapterCallbacks = {
@@ -62,6 +65,16 @@ export class PlayerController {
         this.callbacks.onReady();
       },
       onStateChange: (nextState) => {
+        if (nextState === 'playing') {
+          this.hasEmittedEnded = false;
+        }
+
+        if (nextState === 'ended') {
+          // Guard so ended/auto-advance fires strictly once per track completion
+          if (this.hasEmittedEnded) return;
+          this.hasEmittedEnded = true;
+        }
+
         this.state = nextState;
         this.callbacks.onStateChange(nextState);
 
@@ -71,6 +84,10 @@ export class PlayerController {
           if (cur > 0 || dur > 0) {
             this.callbacks.onProgressSave(cur, dur);
           }
+        }
+
+        if (nextState === 'ended') {
+          this.callbacks.onEnded();
         }
       },
       onTimeUpdate: (cur, dur) => {
@@ -193,6 +210,7 @@ export class PlayerController {
   }
 
   destroyAdapter() {
+    this.hasEmittedEnded = false;
     this._resetPendingSeek();
     if (this.adapter) {
       this.adapter.destroy();
