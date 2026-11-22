@@ -12,7 +12,20 @@ const studyItemSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    sourceType: {
+      type: String,
+      enum: ['youtube', 'vimeo', 'direct', 'local'],
+      default: 'youtube',
+    },
+    sourceUrl: {
+      type: String,
+      default: null,
+    },
     playlistId: {
+      type: String,
+      default: null,
+    },
+    playlistTitle: {
       type: String,
       default: null,
     },

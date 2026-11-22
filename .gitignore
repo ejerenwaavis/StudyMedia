@@ -1,6 +1,8 @@
 node_modules/
 client/node_modules/
+sidecar/node_modules/
 .env
+sidecar/.env
 *.log
 tmp/
 .DS_Store

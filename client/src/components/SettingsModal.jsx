@@ -1,5 +1,24 @@
-import React, { useState } from 'react';
-import { X, Sliders, Cloud, Smartphone, ShieldCheck } from 'lucide-react';
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  X,
+  Sliders,
+  Cloud,
+  Smartphone,
+  ShieldCheck,
+  HardDrive,
+  Trash2,
+  Server,
+  CheckCircle2,
+  AlertCircle,
+  Eye,
+  EyeOff,
+  ExternalLink,
+} from 'lucide-react';
+import { getStorageEstimate } from '../storage/mediaDB';
+import {
+  checkSidecarHealth,
+  DEFAULT_FALLBACK_CONVERTER_URL,
+} from '../utils/sidecarClient';
 
 export default function SettingsModal({
   isOpen,
@@ -9,12 +28,55 @@ export default function SettingsModal({
   doubleTapWindow,
   workspaceId,
   dbConnected,
+  sidecarUrl = '',
+  sidecarApiKey = '',
+  fallbackConverterUrl = DEFAULT_FALLBACK_CONVERTER_URL,
   onSave,
+  onClearOfflineMedia,
 }) {
   const [customInterval, setCustomInterval] = useState(String(seekInterval));
   const [dtEnabled, setDtEnabled] = useState(doubleTapToSkip);
   const [dtWindow, setDtWindow] = useState(doubleTapWindow);
   const [wsId, setWsId] = useState(workspaceId);
+  const [scUrl, setScUrl] = useState(sidecarUrl);
+  const [scKey, setScKey] = useState(sidecarApiKey);
+  const [showKey, setShowKey] = useState(false);
+  const [converterUrl, setConverterUrl] = useState(
+    fallbackConverterUrl || DEFAULT_FALLBACK_CONVERTER_URL
+  );
+
+  const [storageInfo, setStorageInfo] = useState(null);
+  const [clearingStorage, setClearingStorage] = useState(false);
+  const [sidecarPing, setSidecarPing] = useState(null); // null | { loading } | { ok, status, message }
+
+  const refreshStorage = useCallback(async () => {
+    const info = await getStorageEstimate();
+    setStorageInfo(info);
+  }, []);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setCustomInterval(String(seekInterval));
+    setDtEnabled(doubleTapToSkip);
+    setDtWindow(doubleTapWindow);
+    setWsId(workspaceId);
+    setScUrl(sidecarUrl);
+    setScKey(sidecarApiKey);
+    setShowKey(false);
+    setConverterUrl(fallbackConverterUrl || DEFAULT_FALLBACK_CONVERTER_URL);
+    setSidecarPing(null);
+    refreshStorage();
+  }, [
+    isOpen,
+    seekInterval,
+    doubleTapToSkip,
+    doubleTapWindow,
+    workspaceId,
+    sidecarUrl,
+    sidecarApiKey,
+    fallbackConverterUrl,
+    refreshStorage,
+  ]);
 
   if (!isOpen) return null;
 
@@ -26,17 +88,46 @@ export default function SettingsModal({
       doubleTapToSkip: dtEnabled,
       doubleTapWindow: dtWindow,
       workspaceId: wsId.trim() || 'default',
+      sidecarUrl: scUrl.trim(),
+      sidecarApiKey: scKey.trim(),
+      fallbackConverterUrl: converterUrl.trim() || DEFAULT_FALLBACK_CONVERTER_URL,
     });
     onClose();
   };
 
+  const handleClearOffline = async () => {
+    if (!onClearOfflineMedia) return;
+    setClearingStorage(true);
+    try {
+      await onClearOfflineMedia();
+      await refreshStorage();
+    } finally {
+      setClearingStorage(false);
+    }
+  };
+
+  const handleTestSidecar = async () => {
+    setSidecarPing({ loading: true });
+    const res = await checkSidecarHealth(scUrl, scKey, 1500);
+    setSidecarPing({
+      loading: false,
+      ok: res.ok,
+      status: res.status,
+      message: res.ok
+        ? 'Online — Authenticated'
+        : res.status === 'unauthorized'
+        ? 'Invalid Key (401)'
+        : res.error || 'Offline',
+    });
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
-      <div className="w-full max-w-md rounded-2xl border border-zinc-800 bg-obsidian-900 p-5 shadow-2xl">
+      <div className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-zinc-800 bg-obsidian-900 p-5 shadow-2xl">
         <div className="mb-4 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Sliders className="h-5 w-5 text-amber-400" />
-            <h3 className="text-base font-bold text-white">Hardware & Sync Settings</h3>
+            <h3 className="text-base font-bold text-white">Hardware, Offline & Sync Settings</h3>
           </div>
           <button
             type="button"
@@ -101,6 +192,151 @@ export default function SettingsModal({
             )}
           </div>
 
+          {/* Offline Storage Quota & Cleanup (IndexedDB) */}
+          <div className="rounded-xl border border-zinc-800 bg-obsidian-950 p-3.5">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <span className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-zinc-400">
+                <HardDrive className="h-3.5 w-3.5 text-emerald-400" />
+                Offline Media Storage (IndexedDB)
+              </span>
+              {storageInfo && (
+                <span className="font-mono text-[11px] text-emerald-400">
+                  {storageInfo.localFilesCount} file{storageInfo.localFilesCount === 1 ? '' : 's'} (
+                  {storageInfo.formattedLocalBytes})
+                </span>
+              )}
+            </div>
+
+            <div className="mb-2 h-2 w-full overflow-hidden rounded-full bg-obsidian-800">
+              <div
+                className="h-full rounded-full bg-emerald-400 transition-all"
+                style={{
+                  width: `${Math.max(
+                    storageInfo?.pct || 0,
+                    storageInfo?.localFilesBytes > 0 ? 2 : 0
+                  )}%`,
+                }}
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="font-mono text-[11px] text-zinc-400">
+                {storageInfo ? storageInfo.summaryText : 'Calculating storage quota...'}
+              </p>
+              <button
+                type="button"
+                disabled={clearingStorage || !storageInfo?.localFilesCount}
+                onClick={handleClearOffline}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-500/10 px-2.5 py-1.5 text-[11px] font-semibold text-red-400 transition hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                {clearingStorage ? 'Clearing...' : 'Clear Offline Media'}
+              </button>
+            </div>
+          </div>
+
+          {/* 3-Tier Download Pipeline: Home Sidecar + Fallback Public Converter */}
+          <div className="space-y-3 rounded-xl border border-zinc-800 bg-obsidian-950 p-3.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-zinc-400">
+                <Server className="h-3.5 w-3.5 text-amber-400" />
+                Home Sidecar & Download Pipeline
+              </span>
+              <div className="flex items-center gap-2">
+                {sidecarPing && !sidecarPing.loading && (
+                  <span
+                    className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                      sidecarPing.ok
+                        ? 'bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/30'
+                        : 'bg-red-500/15 text-red-400 ring-1 ring-red-500/30'
+                    }`}
+                  >
+                    {sidecarPing.ok ? (
+                      <CheckCircle2 className="h-3 w-3" />
+                    ) : (
+                      <AlertCircle className="h-3 w-3" />
+                    )}
+                    {sidecarPing.ok
+                      ? 'Online'
+                      : sidecarPing.status === 'unauthorized'
+                      ? 'Invalid Key'
+                      : 'Offline'}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={handleTestSidecar}
+                  disabled={!scUrl.trim() || !scKey.trim() || sidecarPing?.loading}
+                  className="rounded-md border border-zinc-700 bg-obsidian-800 px-2.5 py-1 text-[11px] font-semibold text-zinc-200 transition hover:border-amber-500/50 hover:text-white disabled:opacity-40"
+                >
+                  {sidecarPing?.loading ? 'Testing...' : 'Test Connection'}
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-2.5">
+              <div>
+                <label className="mb-1 block text-[11px] font-medium text-zinc-400">
+                  Tier 1 — Private Home Sidecar URL
+                </label>
+                <input
+                  type="url"
+                  value={scUrl}
+                  onChange={(e) => setScUrl(e.target.value)}
+                  placeholder="https://sidecar.aceddivision.com or https://xxx.trycloudflare.com"
+                  className="w-full rounded-lg border border-zinc-700 bg-obsidian-900 px-3 py-2 font-mono text-xs text-white placeholder-zinc-600 focus:border-amber-500 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="mb-1 block text-[11px] font-medium text-zinc-400">
+                  Sidecar Secret API Key (`x-api-key`)
+                </label>
+                <div className="relative">
+                  <input
+                    type={showKey ? 'text' : 'password'}
+                    value={scKey}
+                    onChange={(e) => setScKey(e.target.value)}
+                    placeholder="Enter 16-digit or custom secret key"
+                    autoComplete="off"
+                    className="w-full rounded-lg border border-zinc-700 bg-obsidian-900 py-2 pl-3 pr-9 font-mono text-xs text-white placeholder-zinc-600 focus:border-amber-500 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowKey((prev) => !prev)}
+                    title={showKey ? 'Hide API Key' : 'Show API Key'}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-200"
+                  >
+                    {showKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                  </button>
+                </div>
+              </div>
+
+              {sidecarPing && !sidecarPing.loading && !sidecarPing.ok && (
+                <p className="text-[11px] text-red-400">{sidecarPing.message}</p>
+              )}
+
+              <div className="border-t border-zinc-800/80 pt-2.5">
+                <label className="mb-1 flex items-center gap-1.5 text-[11px] font-medium text-zinc-400">
+                  <ExternalLink className="h-3 w-3 text-amber-400" />
+                  Tier 2 — Fallback External Downloader URL
+                </label>
+                <input
+                  type="url"
+                  value={converterUrl}
+                  onChange={(e) => setConverterUrl(e.target.value)}
+                  placeholder={DEFAULT_FALLBACK_CONVERTER_URL}
+                  className="w-full rounded-lg border border-zinc-700 bg-obsidian-900 px-3 py-2 font-mono text-xs text-white placeholder-zinc-600 focus:border-amber-500 focus:outline-none"
+                />
+                <p className="mt-1 text-[10px] text-zinc-500">
+                  Used when Home Sidecar is offline. Auto-copies YouTube URL and supports optional{' '}
+                  <code className="text-zinc-300">{'{url}'}</code> or{' '}
+                  <code className="text-zinc-300">{'{id}'}</code> tokens.
+                </p>
+              </div>
+            </div>
+          </div>
+
           {/* Cloud Sync Profile */}
           <div className="rounded-xl border border-zinc-800 bg-obsidian-950 p-3.5">
             <div className="mb-2 flex items-center justify-between">
@@ -126,7 +362,7 @@ export default function SettingsModal({
               className="w-full rounded-lg border border-zinc-700 bg-obsidian-900 px-3 py-2 font-mono text-xs text-white focus:border-amber-500 focus:outline-none"
             />
             <p className="mt-1.5 text-[11px] text-zinc-500">
-              Use the same Profile ID on your phone and desktop to sync queue & resume timestamps.
+              Use the same Profile ID on your phone and desktop to sync queue, resume timestamps & sidecar config.
             </p>
           </div>
 
@@ -134,25 +370,30 @@ export default function SettingsModal({
           <div className="flex items-start gap-2.5 rounded-xl border border-zinc-800/80 bg-obsidian-950/60 p-3 text-xs text-zinc-400">
             <Smartphone className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
             <span>
-              Install StudyMedia as a PWA (or via Chrome Extension) for persistent background MediaSession & Screen Wake Lock support.
+              Install StudyMedia as a PWA for Airplane Mode support, auto-updating builds, offline IndexedDB playback, and native lock-screen controls.
             </span>
           </div>
 
-          <div className="flex justify-end gap-2 pt-2">
-            <button
-              type="button"
-              onClick={onClose}
-              className="rounded-xl px-4 py-2 text-xs font-semibold text-zinc-400 hover:bg-obsidian-800 hover:text-white"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              className="flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-bold text-black hover:bg-amber-400"
-            >
-              <ShieldCheck className="h-4 w-4" />
-              Save Settings
-            </button>
+          <div className="flex items-center justify-between gap-2 pt-2">
+            <span className="font-mono text-[10px] text-zinc-500">
+              StudyMedia v2.1 • Nov 22
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-xl px-4 py-2 text-xs font-semibold text-zinc-400 hover:bg-obsidian-800 hover:text-white"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-bold text-black hover:bg-amber-400"
+              >
+                <ShieldCheck className="h-4 w-4" />
+                Save Settings
+              </button>
+            </div>
           </div>
         </form>
       </div>

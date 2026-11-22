@@ -45,6 +45,18 @@ const userSettingsSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+    sidecarUrl: {
+      type: String,
+      default: '',
+    },
+    sidecarApiKey: {
+      type: String,
+      default: '',
+    },
+    fallbackConverterUrl: {
+      type: String,
+      default: 'https://ytmp3.gl/',
+    },
   },
   { timestamps: true }
 );

@@ -19,6 +19,13 @@ import {
   SkipForward,
   Radio,
   Link2,
+  Upload,
+  WifiOff,
+  Loader2,
+  CheckCircle2,
+  AlertCircle,
+  HardDrive,
+  RefreshCw,
 } from 'lucide-react';
 import VideoPlayer from './components/VideoPlayer';
 import QueuePanel from './components/QueuePanel';
@@ -26,7 +33,28 @@ import CarControlDeck from './components/CarControlDeck';
 import SettingsModal from './components/SettingsModal';
 import { useMediaSession } from './hooks/useMediaSession';
 import { useWakeLock } from './hooks/useWakeLock';
-import { parseYouTubeUrl, getThumbnailUrl, formatTime, fetchVideoMetadata } from './utils/youtube';
+import { useOnlineStatus } from './hooks/useOnlineStatus';
+import { formatTime } from './utils/youtube';
+import {
+  detectSourceFromUrl,
+  createLocalQueueItem,
+  normalizeQueueItem,
+  fetchSourceMetadata,
+  fetchYouTubePlaylist,
+  getExternalUrl,
+} from './utils/sourceDetector';
+import {
+  saveMediaFile,
+  deleteMediaFile,
+  clearAllMediaFiles,
+  extractMediaInfo,
+} from './storage/mediaDB';
+import {
+  extractViaSidecar,
+  loadSidecarConfig,
+  saveSidecarConfig,
+  DEFAULT_FALLBACK_CONVERTER_URL,
+} from './utils/sidecarClient';
 
 const STORAGE_KEY = 'studymedia_state_v1';
 const INTERVAL_PRESETS = [5, 10, 15, 30, 60];
@@ -36,7 +64,11 @@ function loadLocalState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed?.items)) {
+      parsed.items = parsed.items.map(normalizeQueueItem).filter(Boolean);
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -44,11 +76,13 @@ function loadLocalState() {
 
 export default function App() {
   const initialLocal = useMemo(() => loadLocalState(), []);
+  const initialSidecar = useMemo(() => loadSidecarConfig(), []);
 
   const [workspaceId, setWorkspaceId] = useState(initialLocal?.workspaceId || 'default');
   const [items, setItems] = useState(initialLocal?.items || []);
-  const [activeVideoId, setActiveVideoId] = useState(initialLocal?.activeVideoId || null);
-  const [activePlaylistId, setActivePlaylistId] = useState(initialLocal?.activePlaylistId || null);
+  const [activeItemId, setActiveItemId] = useState(
+    initialLocal?.activeItemId || initialLocal?.activeVideoId || null
+  );
 
   const [mode, setMode] = useState(initialLocal?.mode || 'study'); // 'study' | 'car' | 'theater'
   const [seekInterval, setSeekInterval] = useState(initialLocal?.seekInterval || 15);
@@ -59,20 +93,45 @@ export default function App() {
   const [doubleTapWindow, setDoubleTapWindow] = useState(initialLocal?.doubleTapWindow || 450);
   const [audioOnlyMode, setAudioOnlyMode] = useState(initialLocal?.audioOnlyMode || false);
 
+  const [sidecarUrl, setSidecarUrl] = useState(initialSidecar.sidecarUrl);
+  const [sidecarApiKey, setSidecarApiKey] = useState(initialSidecar.sidecarApiKey);
+  const [fallbackConverterUrl, setFallbackConverterUrl] = useState(
+    initialSidecar.fallbackConverterUrl || DEFAULT_FALLBACK_CONVERTER_URL
+  );
+
   const [urlInput, setUrlInput] = useState('');
   const [urlError, setUrlError] = useState('');
+  const [isAddingUrl, setIsAddingUrl] = useState(false);
+  const [isImportingLocal, setIsImportingLocal] = useState(false);
+  const [extractingItemId, setExtractingItemId] = useState(null);
+  const [extractProgress, setExtractProgress] = useState(null);
+  const [isRefreshingApp, setIsRefreshingApp] = useState(false);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [dbConnected, setDbConnected] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [showSignalToast, setShowSignalToast] = useState(false);
+  const [statusToast, setStatusToast] = useState(null); // { type: 'info'|'success'|'error', text }
   const [installPrompt, setInstallPrompt] = useState(null);
 
   const playerRef = useRef(null);
+  const localFileInputRef = useRef(null);
   const toastTimerRef = useRef(null);
+  const statusToastTimerRef = useRef(null);
+  const dragCounterRef = useRef(0);
 
   const wakeLock = useWakeLock(true);
+  const isOnline = useOnlineStatus();
+  const sidecarConfigured = Boolean(sidecarUrl.trim() && sidecarApiKey.trim());
+
+  const showNotice = useCallback((text, type = 'success') => {
+    setStatusToast({ id: Date.now(), type, text });
+    clearTimeout(statusToastTimerRef.current);
+    statusToastTimerRef.current = setTimeout(() => setStatusToast(null), 3600);
+  }, []);
 
   // Derived Queue & History
   const queue = useMemo(
@@ -92,16 +151,16 @@ export default function App() {
   );
 
   const activeItem = useMemo(
-    () => items.find((i) => i.videoId === activeVideoId) || null,
-    [items, activeVideoId]
+    () => items.find((i) => (i.id || i.videoId) === activeItemId) || null,
+    [items, activeItemId]
   );
 
   const activeQueueIndex = useMemo(
-    () => queue.findIndex((i) => i.videoId === activeVideoId),
-    [queue, activeVideoId]
+    () => queue.findIndex((i) => (i.id || i.videoId) === activeItemId),
+    [queue, activeItemId]
   );
 
-  // Save to localStorage whenever core state changes
+  // Persist core state to localStorage (excluding raw blobs which live in IndexedDB)
   useEffect(() => {
     try {
       localStorage.setItem(
@@ -109,8 +168,8 @@ export default function App() {
         JSON.stringify({
           workspaceId,
           items,
-          activeVideoId,
-          activePlaylistId,
+          activeItemId,
+          activeVideoId: activeItemId,
           mode,
           seekInterval,
           playbackSpeed,
@@ -125,8 +184,7 @@ export default function App() {
   }, [
     workspaceId,
     items,
-    activeVideoId,
-    activePlaylistId,
+    activeItemId,
     mode,
     seekInterval,
     playbackSpeed,
@@ -134,6 +192,11 @@ export default function App() {
     doubleTapWindow,
     audioOnlyMode,
   ]);
+
+  // Persist Sidecar & Tier 2 Fallback Converter config in localStorage
+  useEffect(() => {
+    saveSidecarConfig({ sidecarUrl, sidecarApiKey, fallbackConverterUrl });
+  }, [sidecarUrl, sidecarApiKey, fallbackConverterUrl]);
 
   // Listen for PWA install prompt
   useEffect(() => {
@@ -145,8 +208,9 @@ export default function App() {
     return () => window.removeEventListener('beforeinstallprompt', handler);
   }, []);
 
-  // Load state from MongoDB backend on mount or workspaceId change
+  // Load state from MongoDB backend on mount or workspaceId change (merging safely with local IndexedDB items)
   useEffect(() => {
+    if (!isOnline) return;
     let cancelled = false;
     async function syncFromServer() {
       try {
@@ -161,12 +225,41 @@ export default function App() {
         if (cancelled || !data?.synced) return;
 
         if (Array.isArray(data.items) && data.items.length > 0) {
-          setItems(data.items);
-          if (!activeVideoId) {
-            const firstQueue = data.items.find((i) => i.inQueue) || data.items[0];
+          const remoteNormalized = data.items.map(normalizeQueueItem).filter(Boolean);
+          setItems((prev) => {
+            const localById = new Map(prev.map((i) => [i.id, i]));
+            const merged = [];
+            const seen = new Set();
+
+            // Preserve local offline-ready upgrades if same ID exists locally
+            for (const remote of remoteNormalized) {
+              seen.add(remote.id);
+              const existing = localById.get(remote.id);
+              if (existing?.isOfflineReady) {
+                merged.push({
+                  ...remote,
+                  ...existing,
+                  lastPosition: Math.max(remote.lastPosition || 0, existing.lastPosition || 0),
+                });
+              } else {
+                merged.push(remote);
+              }
+            }
+
+            // Retain any device-local IndexedDB items not in MongoDB
+            for (const localItem of prev) {
+              if (!seen.has(localItem.id) && (localItem.isOfflineReady || localItem.sourceType === 'local')) {
+                merged.push(localItem);
+              }
+            }
+
+            return merged;
+          });
+
+          if (!activeItemId) {
+            const firstQueue = remoteNormalized.find((i) => i.inQueue) || remoteNormalized[0];
             if (firstQueue) {
-              setActiveVideoId(firstQueue.videoId);
-              setActivePlaylistId(firstQueue.playlistId || null);
+              setActiveItemId(firstQueue.id);
             }
           }
         }
@@ -177,8 +270,14 @@ export default function App() {
             setDoubleTapToSkip(data.settings.doubleTapToSkip);
           if (data.settings.doubleTapWindow) setDoubleTapWindow(data.settings.doubleTapWindow);
           if (data.settings.activeMode) setMode(data.settings.activeMode);
-          if (data.settings.activeVideoId && !activeVideoId)
-            setActiveVideoId(data.settings.activeVideoId);
+          if (data.settings.activeVideoId && !activeItemId)
+            setActiveItemId(data.settings.activeVideoId);
+          if (data.settings.sidecarUrl && !sidecarUrl)
+            setSidecarUrl(data.settings.sidecarUrl);
+          if (data.settings.sidecarApiKey && !sidecarApiKey)
+            setSidecarApiKey(data.settings.sidecarApiKey);
+          if (data.settings.fallbackConverterUrl)
+            setFallbackConverterUrl(data.settings.fallbackConverterUrl);
         }
       } catch {
         // Offline or local-only fallback
@@ -188,52 +287,91 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [workspaceId]);
+  }, [workspaceId, isOnline]);
 
   const syncSettingsToServer = useCallback(
     (patch) => {
+      if (!isOnline) return;
       fetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ workspaceId, ...patch }),
       }).catch(() => {});
     },
-    [workspaceId]
+    [workspaceId, isOnline]
   );
 
-  // Navigation between queued lectures
-  const handleNextVideo = useCallback(() => {
-    if (queue.length === 0) return;
-    const nextIdx = activeQueueIndex >= 0 ? (activeQueueIndex + 1) % queue.length : 0;
-    const next = queue[nextIdx];
-    if (next) {
-      setActiveVideoId(next.videoId);
-      setActivePlaylistId(next.playlistId || null);
-      syncSettingsToServer({ activeVideoId: next.videoId });
-    }
-  }, [queue, activeQueueIndex, syncSettingsToServer]);
+  const syncItemToServer = useCallback(
+    (item) => {
+      if (!isOnline || !item || item.sourceType === 'local' || item.id.startsWith('local:')) return;
+      fetch('/api/items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspaceId,
+          videoId: item.id,
+          sourceType: item.sourceType,
+          sourceUrl: item.sourceUrl,
+          playlistId: item.playlistId,
+          playlistTitle: item.playlistTitle,
+          title: item.title,
+          author: item.author || '',
+          thumbnail: item.thumbnail || '',
+          duration: item.duration || 0,
+          lastPosition: item.lastPosition || 0,
+          inQueue: item.inQueue,
+          queueOrder: item.queueOrder,
+        }),
+      }).catch(() => {});
+    },
+    [workspaceId, isOnline]
+  );
 
-  const handlePrevVideo = useCallback(() => {
+  // Navigation between queued lectures (respects offline mode by preferring playable items)
+  const handleNextTrack = useCallback(() => {
     if (queue.length === 0) return;
-    const prevIdx =
-      activeQueueIndex > 0 ? activeQueueIndex - 1 : Math.max(0, queue.length - 1);
-    const prev = queue[prevIdx];
-    if (prev) {
-      setActiveVideoId(prev.videoId);
-      setActivePlaylistId(prev.playlistId || null);
-      syncSettingsToServer({ activeVideoId: prev.videoId });
+    const playableQueue = isOnline ? queue : queue.filter((i) => i.isOfflineReady);
+    const list = playableQueue.length > 0 ? playableQueue : queue;
+    const curIdx = list.findIndex((i) => i.id === activeItemId);
+    const nextIdx = curIdx >= 0 ? (curIdx + 1) % list.length : 0;
+    const next = list[nextIdx];
+    if (next) {
+      setActiveItemId(next.id);
+      if (next.sourceType !== 'local') {
+        syncSettingsToServer({ activeVideoId: next.id });
+      }
     }
-  }, [queue, activeQueueIndex, syncSettingsToServer]);
+  }, [queue, isOnline, activeItemId, syncSettingsToServer]);
+
+  const handlePrevTrack = useCallback(() => {
+    if (queue.length === 0) return;
+    const playableQueue = isOnline ? queue : queue.filter((i) => i.isOfflineReady);
+    const list = playableQueue.length > 0 ? playableQueue : queue;
+    const curIdx = list.findIndex((i) => i.id === activeItemId);
+    const prevIdx = curIdx > 0 ? curIdx - 1 : Math.max(0, list.length - 1);
+    const prev = list[prevIdx];
+    if (prev) {
+      setActiveItemId(prev.id);
+      if (prev.sourceType !== 'local') {
+        syncSettingsToServer({ activeVideoId: prev.id });
+      }
+    }
+  }, [queue, isOnline, activeItemId, syncSettingsToServer]);
 
   const handleSeekRelative = useCallback((delta) => {
     playerRef.current?.seekRelative(delta);
   }, []);
 
-  // Hardware MediaSession Hijacker & Silent Audio Lock
-  const { sessionLockActive, lastSignal, triggerTestSignal } = useMediaSession({
+  const handleTogglePlay = useCallback(() => {
+    playerRef.current?.togglePlay();
+  }, []);
+
+  // Unified Hardware MediaSession & Conditional Silent Audio Lock
+  const { sessionLockActive, sessionLockMode, lastSignal, triggerTestSignal } = useMediaSession({
+    sourceType: activeItem?.sourceType || 'youtube',
     isPlaying,
-    title: activeItem?.title || (activeVideoId ? `Lecture (${activeVideoId})` : 'StudyMedia'),
-    thumbnail: activeItem?.thumbnail || getThumbnailUrl(activeVideoId),
+    title: activeItem?.title || (activeItemId ? `Lecture (${activeItemId})` : 'StudyMedia'),
+    thumbnail: activeItem?.thumbnail || '',
     seekInterval,
     playbackSpeed,
     duration,
@@ -241,8 +379,9 @@ export default function App() {
     doubleTapToSkip,
     doubleTapWindow,
     onSeekRelative: handleSeekRelative,
-    onNextVideo: handleNextVideo,
-    onPrevVideo: handlePrevVideo,
+    onNextTrack: handleNextTrack,
+    onPrevTrack: handlePrevTrack,
+    onTogglePlay: handleTogglePlay,
     onPlay: () => playerRef.current?.play(),
     onPause: () => playerRef.current?.pause(),
   });
@@ -277,87 +416,369 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [handleSeekRelative, seekInterval]);
 
-  // Add or Play YouTube URL
+  // Import one or more local media files (from picker or drag-and-drop) into IndexedDB
+  const handleImportLocalFiles = useCallback(
+    async (fileList, playFirst = true) => {
+      const files = Array.from(fileList || []).filter(
+        (f) =>
+          f.type.startsWith('video/') ||
+          f.type.startsWith('audio/') ||
+          /\.(mp4|m4v|webm|mov|mp3|m4a|wav|ogg|aac|flac|opus)$/i.test(f.name)
+      );
+
+      if (files.length === 0) {
+        showNotice('Please choose valid video or audio files (MP4, MP3, M4A, WebM).', 'error');
+        return;
+      }
+
+      setIsImportingLocal(true);
+      try {
+        const importedItems = [];
+        const baseOrder = queue.length;
+
+        for (let idx = 0; idx < files.length; idx++) {
+          const file = files[idx];
+          const info = await extractMediaInfo(file, 5);
+          const id = `local:${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 7)}`;
+
+          await saveMediaFile({
+            id,
+            fileName: file.name,
+            mimeType: file.type || (info.isAudio ? 'audio/mpeg' : 'video/mp4'),
+            sizeBytes: file.size,
+            blob: file,
+            thumbnailDataUrl: info.thumbnailDataUrl,
+            duration: info.duration,
+          });
+
+          importedItems.push(
+            createLocalQueueItem({
+              id,
+              fileName: file.name,
+              mimeType: file.type || (info.isAudio ? 'audio/mpeg' : 'video/mp4'),
+              sizeBytes: file.size,
+              thumbnailDataUrl: info.thumbnailDataUrl,
+              duration: info.duration,
+              queueOrder: baseOrder + idx,
+            })
+          );
+        }
+
+        setItems((prev) => [...prev, ...importedItems]);
+
+        if (playFirst && importedItems[0]) {
+          setActiveItemId(importedItems[0].id);
+        }
+
+        showNotice(
+          importedItems.length === 1
+            ? `Saved "${importedItems[0].title}" for offline playback`
+            : `Imported ${importedItems.length} offline lectures into Study Queue`,
+          'success'
+        );
+      } catch (err) {
+        showNotice(err?.message || 'Failed to save local media to IndexedDB.', 'error');
+      } finally {
+        setIsImportingLocal(false);
+      }
+    },
+    [queue.length, showNotice]
+  );
+
+  // Desktop drag-and-drop listeners
+  useEffect(() => {
+    const onDragEnter = (e) => {
+      if (!e.dataTransfer?.types?.includes('Files')) return;
+      e.preventDefault();
+      dragCounterRef.current += 1;
+      setIsDraggingFiles(true);
+    };
+    const onDragOver = (e) => {
+      if (!e.dataTransfer?.types?.includes('Files')) return;
+      e.preventDefault();
+    };
+    const onDragLeave = (e) => {
+      if (!e.dataTransfer?.types?.includes('Files')) return;
+      e.preventDefault();
+      dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+      if (dragCounterRef.current === 0) setIsDraggingFiles(false);
+    };
+    const onDrop = (e) => {
+      e.preventDefault();
+      dragCounterRef.current = 0;
+      setIsDraggingFiles(false);
+      if (e.dataTransfer?.files?.length) {
+        handleImportLocalFiles(e.dataTransfer.files, !activeItemId);
+      }
+    };
+
+    window.addEventListener('dragenter', onDragEnter);
+    window.addEventListener('dragover', onDragOver);
+    window.addEventListener('dragleave', onDragLeave);
+    window.addEventListener('drop', onDrop);
+    return () => {
+      window.removeEventListener('dragenter', onDragEnter);
+      window.removeEventListener('dragover', onDragOver);
+      window.removeEventListener('dragleave', onDragLeave);
+      window.removeEventListener('drop', onDrop);
+    };
+  }, [handleImportLocalFiles, activeItemId]);
+
+  // Upgrade an existing queue/history item (e.g. Error 101/150 restricted video) to a local IndexedDB copy
+  const handleReplaceWithLocalFile = useCallback(
+    async (targetItem, file) => {
+      if (!targetItem || !file) return;
+      setIsImportingLocal(true);
+      try {
+        const info = await extractMediaInfo(file, 5);
+        const blobId = `local-upgrade:${targetItem.id}:${Date.now()}`;
+
+        // Delete any previously attached blob on this item
+        if (targetItem.localBlobId) {
+          await deleteMediaFile(targetItem.localBlobId).catch(() => {});
+        }
+
+        await saveMediaFile({
+          id: blobId,
+          fileName: file.name,
+          mimeType: file.type || (info.isAudio ? 'audio/mpeg' : 'video/mp4'),
+          sizeBytes: file.size,
+          blob: file,
+          thumbnailDataUrl: info.thumbnailDataUrl || targetItem.thumbnail || null,
+          duration: info.duration || targetItem.duration || 0,
+        });
+
+        setItems((prev) =>
+          prev.map((i) =>
+            i.id === targetItem.id
+              ? {
+                  ...i,
+                  sourceType: 'local',
+                  localBlobId: blobId,
+                  isOfflineReady: true,
+                  mimeType: file.type || (info.isAudio ? 'audio/mpeg' : 'video/mp4'),
+                  sizeBytes: file.size,
+                  thumbnail: i.thumbnail || info.thumbnailDataUrl || null,
+                  duration: info.duration > 0 ? info.duration : i.duration,
+                  inQueue: true,
+                  lastWatchedAt: new Date().toISOString(),
+                }
+              : i
+          )
+        );
+
+        setActiveItemId(targetItem.id);
+        showNotice(`Upgraded "${targetItem.title}" to Offline Ready local playback!`, 'success');
+      } catch (err) {
+        showNotice(err?.message || 'Could not import local replacement file.', 'error');
+      } finally {
+        setIsImportingLocal(false);
+      }
+    },
+    [showNotice]
+  );
+
+  // Pull a YouTube lecture via the user's private Home Sidecar straight into IndexedDB
+  const handleFetchViaSidecar = useCallback(
+    async (targetItem, format = 'mp4') => {
+      const url = getExternalUrl(targetItem);
+      if (!url || !sidecarConfigured) {
+        showNotice('Configure your Home Sidecar URL & API key in Settings first.', 'error');
+        return;
+      }
+
+      setExtractingItemId(targetItem.id);
+      setExtractProgress({ phase: 'extracting', receivedBytes: 0, totalBytes: 0, pct: null });
+      showNotice(`Requesting ${format.toUpperCase()} from Home Sidecar...`, 'info');
+      try {
+        const result = await extractViaSidecar({
+          baseUrl: sidecarUrl,
+          apiKey: sidecarApiKey,
+          url,
+          format,
+          onProgress: (prog) => setExtractProgress(prog),
+        });
+
+        const fileLike = new File([result.blob], result.fileName, { type: result.mimeType });
+        await handleReplaceWithLocalFile(targetItem, fileLike);
+      } catch (err) {
+        showNotice(err?.message || 'Sidecar extraction failed.', 'error');
+      } finally {
+        setExtractingItemId(null);
+        setExtractProgress(null);
+      }
+    },
+    [sidecarConfigured, sidecarUrl, sidecarApiKey, handleReplaceWithLocalFile, showNotice]
+  );
+
+  // Add or Play any URL (YouTube video, YouTube playlist, Vimeo, or Direct MP4/MP3)
   const handleAddUrl = async (playImmediately = true) => {
     setUrlError('');
-    const { videoId, playlistId } = parseYouTubeUrl(urlInput);
+    const detected = detectSourceFromUrl(urlInput);
 
-    if (!videoId && !playlistId) {
-      setUrlError('Please paste a valid YouTube video or playlist URL.');
+    if (!detected) {
+      setUrlError(
+        'Please paste a valid YouTube, YouTube Playlist, Vimeo, or direct MP4/MP3/WebM media URL.'
+      );
       return;
     }
 
-    const effectiveId = videoId || `playlist:${playlistId}`;
-    const thumbnail = videoId ? getThumbnailUrl(videoId) : '';
+    const rawUrl = urlInput.trim();
+    setUrlInput('');
 
-    // Optimistically add item
-    const newItem = {
-      videoId: effectiveId,
-      playlistId,
-      title: videoId ? `Loading lecture (${videoId})...` : `YouTube Playlist`,
-      thumbnail,
-      duration: 0,
-      lastPosition: 0,
+    // Handle YouTube Playlist expansion automatically
+    if (detected.sourceType === 'youtube' && detected.isPlaylist && detected.playlistId) {
+      setIsAddingUrl(true);
+      try {
+        const playlistData = await fetchYouTubePlaylist(detected.playlistId);
+        if (playlistData && Array.isArray(playlistData.items) && playlistData.items.length > 0) {
+          const baseOrder = queue.length;
+          const nowIso = new Date().toISOString();
+
+          const playlistItems = playlistData.items.map((entry, idx) =>
+            normalizeQueueItem({
+              id: entry.videoId,
+              videoId: entry.videoId,
+              sourceType: 'youtube',
+              sourceUrl: entry.sourceUrl,
+              localBlobId: null,
+              playlistId: detected.playlistId,
+              playlistTitle: playlistData.playlistTitle || 'YouTube Playlist',
+              title: entry.title,
+              author: entry.author || '',
+              thumbnail: entry.thumbnail,
+              duration: entry.duration || 0,
+              lastPosition: 0,
+              isOfflineReady: false,
+              inQueue: true,
+              queueOrder: baseOrder + idx,
+              lastWatchedAt: nowIso,
+            })
+          );
+
+          setItems((prev) => {
+            const existingMap = new Map(prev.map((i) => [i.id, i]));
+            const nextList = [...prev];
+            for (const pItem of playlistItems) {
+              const existing = existingMap.get(pItem.id);
+              if (existing) {
+                const idxInList = nextList.findIndex((x) => x.id === pItem.id);
+                if (idxInList >= 0) {
+                  nextList[idxInList] = {
+                    ...existing,
+                    inQueue: true,
+                    playlistId: pItem.playlistId,
+                    playlistTitle: pItem.playlistTitle,
+                    title: existing.title?.startsWith('Loading') ? pItem.title : existing.title,
+                    duration: existing.duration || pItem.duration,
+                  };
+                }
+              } else {
+                nextList.push(pItem);
+              }
+            }
+            return nextList;
+          });
+
+          const targetId =
+            detected.youtubeVideoId &&
+            playlistItems.some((item) => item.id === detected.youtubeVideoId)
+              ? detected.youtubeVideoId
+              : playlistItems[0].id;
+
+          if (playImmediately && targetId) {
+            setActiveItemId(targetId);
+            syncSettingsToServer({ activeVideoId: targetId });
+          }
+
+          // Background sync playlist items (batched cleanly)
+          playlistItems.slice(0, 30).forEach((item) => syncItemToServer(item));
+
+          showNotice(
+            `Added ${playlistItems.length} lectures from "${playlistData.playlistTitle || 'Playlist'}"`,
+            'success'
+          );
+          return;
+        }
+      } finally {
+        setIsAddingUrl(false);
+      }
+    }
+
+    // Standard single source (YouTube video, Vimeo, Direct MP4/MP3, or playlist fallback)
+    const newItem = normalizeQueueItem({
+      ...detected,
       inQueue: true,
       queueOrder: queue.length,
       lastWatchedAt: new Date().toISOString(),
-    };
+    });
 
     setItems((prev) => {
-      const existing = prev.find((i) => i.videoId === effectiveId);
+      const existing = prev.find((i) => i.id === newItem.id);
       if (existing) {
         return prev.map((i) =>
-          i.videoId === effectiveId ? { ...i, inQueue: true, playlistId: playlistId || i.playlistId } : i
+          i.id === newItem.id
+            ? { ...i, inQueue: true, playlistId: newItem.playlistId || i.playlistId }
+            : i
         );
       }
       return [...prev, newItem];
     });
 
     if (playImmediately) {
-      setActiveVideoId(effectiveId);
-      setActivePlaylistId(playlistId);
-      syncSettingsToServer({ activeVideoId: effectiveId });
+      setActiveItemId(newItem.id);
+      syncSettingsToServer({ activeVideoId: newItem.id });
     }
 
-    setUrlInput('');
+    // Fetch real title, author & thumbnail for YouTube & Vimeo in background
+    if (newItem.sourceType === 'youtube' || newItem.sourceType === 'vimeo') {
+      const meta = await fetchSourceMetadata({ ...detected, sourceUrl: newItem.sourceUrl || rawUrl });
+      const resolvedTitle =
+        meta?.title ||
+        (newItem.sourceType === 'vimeo'
+          ? `Vimeo Lecture (${detected.vimeoId || newItem.id})`
+          : detected.youtubeVideoId
+          ? `Lecture (${detected.youtubeVideoId})`
+          : 'YouTube Playlist');
+      const resolvedThumb = meta?.thumbnail || newItem.thumbnail;
+      const resolvedDuration = meta?.duration || newItem.duration || 0;
 
-    // Fetch real title & author in background
-    const meta = await fetchVideoMetadata(videoId, urlInput);
-    const resolvedTitle = meta?.title || (videoId ? `Lecture (${videoId})` : 'YouTube Playlist');
-    const resolvedThumb = meta?.thumbnail || thumbnail;
-
-    setItems((prev) =>
-      prev.map((i) =>
-        i.videoId === effectiveId
-          ? { ...i, title: resolvedTitle, author: meta?.author || '', thumbnail: resolvedThumb }
-          : i
-      )
-    );
-
-    fetch('/api/items', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        workspaceId,
-        videoId: effectiveId,
-        playlistId,
+      const updatedItem = {
+        ...newItem,
         title: resolvedTitle,
         author: meta?.author || '',
         thumbnail: resolvedThumb,
-        inQueue: true,
-        queueOrder: queue.length,
-      }),
-    }).catch(() => {});
+        duration: resolvedDuration,
+      };
+
+      setItems((prev) =>
+        prev.map((i) =>
+          i.id === newItem.id
+            ? {
+                ...i,
+                title: resolvedTitle,
+                author: meta?.author || i.author || '',
+                thumbnail: resolvedThumb || i.thumbnail,
+                duration: resolvedDuration > 0 ? resolvedDuration : i.duration,
+              }
+            : i
+        )
+      );
+
+      syncItemToServer(updatedItem);
+    } else {
+      syncItemToServer(newItem);
+    }
   };
 
   const handleProgressSave = useCallback(
     (time, dur) => {
-      if (!activeVideoId) return;
+      if (!activeItemId) return;
       const nowIso = new Date().toISOString();
 
       setItems((prev) =>
         prev.map((i) =>
-          i.videoId === activeVideoId
+          i.id === activeItemId
             ? {
                 ...i,
                 lastPosition: time,
@@ -368,53 +789,135 @@ export default function App() {
         )
       );
 
-      fetch('/api/progress', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          workspaceId,
-          videoId: activeVideoId,
-          lastPosition: time,
-          duration: dur,
-        }),
-      }).catch(() => {});
+      if (isOnline && activeItem && activeItem.sourceType !== 'local' && !activeItemId.startsWith('local:')) {
+        fetch('/api/progress', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            workspaceId,
+            videoId: activeItemId,
+            sourceType: activeItem.sourceType,
+            sourceUrl: activeItem.sourceUrl,
+            lastPosition: time,
+            duration: dur,
+          }),
+        }).catch(() => {});
+      }
     },
-    [activeVideoId, workspaceId]
+    [activeItemId, activeItem, workspaceId, isOnline]
   );
 
   const handleSelectVideo = (item) => {
-    setActiveVideoId(item.videoId);
-    setActivePlaylistId(item.playlistId || null);
-    syncSettingsToServer({ activeVideoId: item.videoId });
+    const id = item.id || item.videoId;
+    setActiveItemId(id);
+    if (item.sourceType !== 'local') {
+      syncSettingsToServer({ activeVideoId: id });
+    }
   };
 
-  const handleRemoveFromQueue = (videoId) => {
-    setItems((prev) => prev.map((i) => (i.videoId === videoId ? { ...i, inQueue: false } : i)));
-    fetch(`/api/items/${encodeURIComponent(videoId)}?workspaceId=${encodeURIComponent(workspaceId)}`, {
-      method: 'DELETE',
-    }).catch(() => {});
+  const handleRemoveFromQueue = (itemId) => {
+    setItems((prev) => prev.map((i) => (i.id === itemId ? { ...i, inQueue: false } : i)));
+    if (isOnline && !itemId.startsWith('local:')) {
+      fetch(`/api/items/${encodeURIComponent(itemId)}?workspaceId=${encodeURIComponent(workspaceId)}`, {
+        method: 'DELETE',
+      }).catch(() => {});
+    }
   };
 
-  const handleDeleteHistoryItem = (videoId) => {
-    setItems((prev) => prev.filter((i) => i.videoId !== videoId));
-    fetch(
-      `/api/items/${encodeURIComponent(videoId)}?workspaceId=${encodeURIComponent(workspaceId)}&hard=true`,
-      { method: 'DELETE' }
-    ).catch(() => {});
+  const handleDeleteHistoryItem = async (itemId) => {
+    const target = items.find((i) => i.id === itemId);
+    if (target?.localBlobId) {
+      await deleteMediaFile(target.localBlobId).catch(() => {});
+    }
+    setItems((prev) => prev.filter((i) => i.id !== itemId));
+    if (activeItemId === itemId) setActiveItemId(null);
+
+    if (isOnline && !itemId.startsWith('local:')) {
+      fetch(
+        `/api/items/${encodeURIComponent(itemId)}?workspaceId=${encodeURIComponent(workspaceId)}&hard=true`,
+        { method: 'DELETE' }
+      ).catch(() => {});
+    }
+  };
+
+  // Delete ONLY the IndexedDB blob for an offline item to free phone storage
+  const handleDeleteLocalFile = async (item) => {
+    const blobId = item.localBlobId || (item.sourceType === 'local' ? item.id : null);
+    if (blobId) {
+      await deleteMediaFile(blobId).catch(() => {});
+    }
+
+    if (item.sourceUrl) {
+      // Revert upgraded online lecture back to its original online source
+      const detected = detectSourceFromUrl(item.sourceUrl);
+      setItems((prev) =>
+        prev.map((i) =>
+          i.id === item.id
+            ? {
+                ...i,
+                sourceType: detected?.sourceType || 'youtube',
+                localBlobId: null,
+                isOfflineReady: false,
+                sizeBytes: null,
+              }
+            : i
+        )
+      );
+      showNotice(`Deleted offline copy of "${item.title}" to free storage.`, 'info');
+    } else {
+      // Pure local import — remove item cleanly
+      setItems((prev) => prev.filter((i) => i.id !== item.id));
+      if (activeItemId === item.id) setActiveItemId(null);
+      showNotice(`Deleted local file "${item.title}" from device storage.`, 'info');
+    }
+  };
+
+  // Wipe all IndexedDB blobs from Settings Modal
+  const handleClearOfflineMedia = async () => {
+    await clearAllMediaFiles();
+    setItems((prev) =>
+      prev
+        .map((i) => {
+          if (!i.isOfflineReady && i.sourceType !== 'local') return i;
+          if (i.sourceUrl) {
+            const detected = detectSourceFromUrl(i.sourceUrl);
+            return {
+              ...i,
+              sourceType: detected?.sourceType || 'youtube',
+              localBlobId: null,
+              isOfflineReady: false,
+              sizeBytes: null,
+            };
+          }
+          return null;
+        })
+        .filter(Boolean)
+    );
+    showNotice('Cleared all offline media blobs from IndexedDB.', 'info');
   };
 
   const handleMoveQueueItem = (fromIdx, toIdx) => {
     const updatedQueue = [...queue];
     const [moved] = updatedQueue.splice(fromIdx, 1);
     updatedQueue.splice(toIdx, 0, moved);
-    const orderMap = new Map(updatedQueue.map((item, index) => [item.videoId, index]));
+    const orderMap = new Map(updatedQueue.map((item, index) => [item.id, index]));
 
     setItems((prev) =>
       prev.map((item) =>
-        orderMap.has(item.videoId) ? { ...item, queueOrder: orderMap.get(item.videoId) } : item
+        orderMap.has(item.id) ? { ...item, queueOrder: orderMap.get(item.id) } : item
       )
     );
   };
+
+  const handlePlayerStateChange = useCallback(
+    (playing, canonicalState) => {
+      setIsPlaying(playing);
+      if (canonicalState === 'ended' && queue.length > 1) {
+        handleNextTrack();
+      }
+    },
+    [queue.length, handleNextTrack]
+  );
 
   const handleCycleInterval = () => {
     const idx = INTERVAL_PRESETS.indexOf(seekInterval);
@@ -444,10 +947,62 @@ export default function App() {
     }
   };
 
+  // Standalone PWA manual refresh: spin, check SW registration for newer build, then reload
+  const handleAppRefresh = async () => {
+    if (isRefreshingApp) return;
+    setIsRefreshingApp(true);
+    try {
+      if ('serviceWorker' in navigator) {
+        const reg = await navigator.serviceWorker.getRegistration();
+        if (reg) {
+          await Promise.race([
+            reg.update().catch(() => {}),
+            new Promise((resolve) => setTimeout(resolve, 1500)),
+          ]);
+        }
+      }
+    } catch {
+      // ignore SW update errors when offline
+    }
+    setTimeout(() => {
+      window.location.reload();
+    }, 250);
+  };
+
   const progressPct = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
 
   return (
     <div className="min-h-screen bg-obsidian-950 text-zinc-100">
+      {/* Hidden local media file picker */}
+      <input
+        ref={localFileInputRef}
+        type="file"
+        accept="video/*,audio/*"
+        multiple
+        onChange={(e) => {
+          if (e.target.files?.length) {
+            handleImportLocalFiles(e.target.files, true);
+          }
+          e.target.value = '';
+        }}
+        className="hidden"
+      />
+
+      {/* Full-window Desktop Drag & Drop Overlay */}
+      {isDraggingFiles && (
+        <div className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-obsidian-950/85 p-6 backdrop-blur-md">
+          <div className="flex max-w-md flex-col items-center rounded-3xl border-2 border-dashed border-amber-400 bg-obsidian-900/90 p-10 text-center shadow-2xl">
+            <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-amber-500/20 text-amber-400">
+              <Upload className="h-8 w-8" />
+            </div>
+            <h2 className="text-lg font-bold text-white">Drop Local Lectures to Import</h2>
+            <p className="mt-1.5 text-xs text-zinc-400">
+              MP4, WebM, MP3, and M4A files are stored offline in IndexedDB with auto-generated thumbnails.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Top Header */}
       <header className="sticky top-0 z-30 border-b border-zinc-800/80 bg-obsidian-950/90 backdrop-blur-md">
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-3">
@@ -462,8 +1017,14 @@ export default function App() {
                 <span className="hidden rounded-md border border-zinc-800 bg-obsidian-900 px-2 py-0.5 font-mono text-[10px] text-zinc-400 sm:inline-block">
                   studymedia.aceddivision.com
                 </span>
+                {!isOnline && (
+                  <span className="inline-flex items-center gap-1 rounded-full border border-sky-500/40 bg-sky-500/15 px-2.5 py-0.5 text-[10px] font-bold text-sky-300">
+                    <WifiOff className="h-3 w-3" />
+                    Offline Mode
+                  </span>
+                )}
               </div>
-              <p className="text-[11px] text-zinc-500">Hands-Free AVRCP Lecture Player</p>
+              <p className="text-[11px] text-zinc-500">Unified Hands-Free & Offline Lecture Player</p>
             </div>
           </div>
 
@@ -509,21 +1070,33 @@ export default function App() {
 
           {/* Status & Action Pills */}
           <div className="flex items-center gap-2">
-            {/* Session Lock Indicator */}
+            {/* Conditional Session Lock Indicator */}
             <div
-              title="Silent audio lock keeps OS Bluetooth/steering-wheel controls bound to StudyMedia"
+              title={
+                sessionLockMode === 'native'
+                  ? 'Native HTML5 media owns OS Bluetooth & lock-screen controls directly'
+                  : 'Silent audio lock keeps OS Bluetooth/steering-wheel controls bound to StudyMedia'
+              }
               className={`hidden items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium md:flex ${
                 sessionLockActive
                   ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400'
                   : 'border-zinc-800 bg-obsidian-900 text-zinc-400'
               }`}
             >
-              {sessionLockActive ? (
+              {sessionLockMode === 'native' ? (
+                <HardDrive className="h-3.5 w-3.5" />
+              ) : sessionLockActive ? (
                 <Lock className="h-3.5 w-3.5" />
               ) : (
                 <Unlock className="h-3.5 w-3.5" />
               )}
-              <span>{sessionLockActive ? 'Session Lock Active' : 'Lock Standby'}</span>
+              <span>
+                {sessionLockMode === 'native'
+                  ? 'Native MediaSession'
+                  : sessionLockActive
+                  ? 'Session Lock Active'
+                  : 'Lock Standby'}
+              </span>
             </div>
 
             {/* Wake Lock Toggle */}
@@ -553,11 +1126,23 @@ export default function App() {
               </button>
             )}
 
+            {/* Standalone PWA Refresh / Update Check */}
+            <button
+              type="button"
+              onClick={handleAppRefresh}
+              disabled={isRefreshingApp}
+              title="Refresh & Check for App Updates"
+              aria-label="Refresh App"
+              className="rounded-lg border border-zinc-800 bg-obsidian-900 p-2 text-zinc-300 transition hover:border-amber-500/50 hover:text-amber-400 disabled:opacity-60"
+            >
+              <RefreshCw className={`h-4 w-4 ${isRefreshingApp ? 'animate-spin text-amber-400' : ''}`} />
+            </button>
+
             {/* Settings */}
             <button
               type="button"
               onClick={() => setSettingsOpen(true)}
-              title="Hardware & Sync Settings"
+              title="Hardware, Offline Storage & Sync Settings"
               className="rounded-lg border border-zinc-800 bg-obsidian-900 p-2 text-zinc-300 transition hover:border-zinc-700 hover:text-white"
             >
               <Settings className="h-4 w-4" />
@@ -568,7 +1153,7 @@ export default function App() {
 
       {/* Main Content */}
       <main className="mx-auto max-w-7xl px-4 py-5">
-        {/* Universal YouTube URL Bar */}
+        {/* Universal Source URL Bar + Import Local Media */}
         <div className="mb-5">
           <form
             onSubmit={(e) => {
@@ -586,25 +1171,45 @@ export default function App() {
                   setUrlInput(e.target.value);
                   if (urlError) setUrlError('');
                 }}
-                placeholder="Paste any YouTube lecture, live, shorts, or playlist URL..."
+                placeholder="Paste YouTube, playlist, Vimeo, or direct MP4/MP3 URL..."
                 className="w-full rounded-xl border border-zinc-800 bg-obsidian-900 py-3 pl-10 pr-4 text-sm text-white placeholder-zinc-500 transition focus:border-amber-500/70 focus:outline-none"
               />
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <button
                 type="submit"
-                className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 py-3 text-sm font-bold text-black transition hover:bg-amber-400 sm:flex-initial"
+                disabled={isAddingUrl}
+                className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 py-3 text-sm font-bold text-black transition hover:bg-amber-400 disabled:opacity-60 sm:flex-initial"
               >
-                <Play className="h-4 w-4 fill-current" />
+                {isAddingUrl ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Play className="h-4 w-4 fill-current" />
+                )}
                 Play Now
               </button>
               <button
                 type="button"
+                disabled={isAddingUrl}
                 onClick={() => handleAddUrl(false)}
-                className="flex items-center justify-center gap-1.5 rounded-xl border border-zinc-800 bg-obsidian-900 px-4 py-3 text-sm font-semibold text-zinc-200 transition hover:border-zinc-700 hover:bg-obsidian-800"
+                className="flex items-center justify-center gap-1.5 rounded-xl border border-zinc-800 bg-obsidian-900 px-4 py-3 text-sm font-semibold text-zinc-200 transition hover:border-zinc-700 hover:bg-obsidian-800 disabled:opacity-60"
               >
                 <Plus className="h-4 w-4" />
                 Queue
+              </button>
+              <button
+                type="button"
+                disabled={isImportingLocal}
+                onClick={() => localFileInputRef.current?.click()}
+                title="Import local MP4, WebM, MP3, or M4A files for offline study"
+                className="flex items-center justify-center gap-1.5 rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-4 py-3 text-sm font-semibold text-emerald-300 transition hover:border-emerald-500/60 hover:bg-emerald-500/20 disabled:opacity-60"
+              >
+                {isImportingLocal ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Upload className="h-4 w-4" />
+                )}
+                <span>Import Local Media</span>
               </button>
             </div>
           </form>
@@ -614,27 +1219,34 @@ export default function App() {
         {/* Theater Mode Layout */}
         {mode === 'theater' && (
           <div className="space-y-4">
-            {activeVideoId ? (
+            {activeItem ? (
               <VideoPlayer
                 ref={playerRef}
-                videoId={activeVideoId.startsWith('playlist:') ? null : activeVideoId}
-                playlistId={activePlaylistId}
-                title={activeItem?.title}
-                initialTime={activeItem?.lastPosition || 0}
+                source={activeItem}
+                initialTime={activeItem.lastPosition || 0}
                 playbackSpeed={playbackSpeed}
                 seekInterval={seekInterval}
                 audioOnlyMode={audioOnlyMode}
                 theaterMode={true}
-                onStateChange={(playing) => setIsPlaying(playing)}
+                isOnline={isOnline}
+                sidecarUrl={sidecarUrl}
+                sidecarApiKey={sidecarApiKey}
+                fallbackConverterUrl={fallbackConverterUrl}
+                extractingItemId={extractingItemId}
+                extractProgress={extractProgress}
+                onStateChange={handlePlayerStateChange}
                 onTimeUpdate={(cur, dur) => {
                   setCurrentTime(cur);
                   if (dur > 0) setDuration(dur);
                 }}
                 onProgressSave={handleProgressSave}
                 onExitTheater={() => handleModeChange('study')}
+                onReplaceWithLocalFile={handleReplaceWithLocalFile}
+                onFetchViaSidecar={handleFetchViaSidecar}
+                onNotify={showNotice}
               />
             ) : (
-              <EmptyPlayerCard onLoadDemo={() => setUrlInput('https://www.youtube.com/watch?v=dQw4w9WgXcQ')} />
+              <EmptyPlayerCard onImportClick={() => localFileInputRef.current?.click()} />
             )}
             <p className="text-center text-xs text-zinc-500">
               Theater mode: controls fade out after 3 seconds • Move mouse or tap to reveal
@@ -642,39 +1254,53 @@ export default function App() {
           </div>
         )}
 
-        {/* Study Mode Layout (matches mockup) */}
+        {/* Study Mode Layout */}
         {mode === 'study' && (
           <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
             {/* Left / Main Stage */}
             <div className="space-y-4 lg:col-span-8 xl:col-span-9">
-              {activeVideoId ? (
+              {activeItem ? (
                 <VideoPlayer
                   ref={playerRef}
-                  videoId={activeVideoId.startsWith('playlist:') ? null : activeVideoId}
-                  playlistId={activePlaylistId}
-                  title={activeItem?.title}
-                  initialTime={activeItem?.lastPosition || 0}
+                  source={activeItem}
+                  initialTime={activeItem.lastPosition || 0}
                   playbackSpeed={playbackSpeed}
                   seekInterval={seekInterval}
                   audioOnlyMode={audioOnlyMode}
                   theaterMode={false}
-                  onStateChange={(playing) => setIsPlaying(playing)}
+                  isOnline={isOnline}
+                  sidecarUrl={sidecarUrl}
+                  sidecarApiKey={sidecarApiKey}
+                  fallbackConverterUrl={fallbackConverterUrl}
+                  extractingItemId={extractingItemId}
+                  extractProgress={extractProgress}
+                  onStateChange={handlePlayerStateChange}
                   onTimeUpdate={(cur, dur) => {
                     setCurrentTime(cur);
                     if (dur > 0) setDuration(dur);
                   }}
                   onProgressSave={handleProgressSave}
+                  onReplaceWithLocalFile={handleReplaceWithLocalFile}
+                  onFetchViaSidecar={handleFetchViaSidecar}
+                  onNotify={showNotice}
                 />
               ) : (
-                <EmptyPlayerCard />
+                <EmptyPlayerCard onImportClick={() => localFileInputRef.current?.click()} />
               )}
 
               {/* Progress Scrubber & Timestamps */}
               <div className="rounded-2xl border border-zinc-800/80 bg-obsidian-900 p-4">
                 <div className="mb-2 flex items-center justify-between gap-2">
-                  <p className="truncate text-sm font-semibold text-zinc-100">
-                    {activeItem?.title || 'Ready to study'}
-                  </p>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <p className="truncate text-sm font-semibold text-zinc-100">
+                      {activeItem?.title || 'Ready to study'}
+                    </p>
+                    {activeItem?.isOfflineReady && (
+                      <span className="shrink-0 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-400">
+                        Offline Ready
+                      </span>
+                    )}
+                  </div>
                   <span className="shrink-0 font-mono text-xs text-zinc-400">
                     {formatTime(currentTime)} <span className="text-zinc-600">/</span>{' '}
                     {formatTime(duration)}
@@ -703,14 +1329,14 @@ export default function App() {
                   />
                 </div>
 
-                {/* Study Mode Controls Bar (matches mockup) */}
+                {/* Study Mode Controls Bar */}
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="flex items-center gap-2.5">
                     <button
                       type="button"
-                      onClick={handlePrevVideo}
+                      onClick={handlePrevTrack}
                       disabled={queue.length < 2}
-                      title="Previous Video"
+                      title="Previous Lecture"
                       className="rounded-full p-2 text-zinc-400 transition hover:bg-obsidian-800 hover:text-white disabled:opacity-30"
                     >
                       <SkipBack className="h-4 w-4" />
@@ -728,7 +1354,7 @@ export default function App() {
 
                     <button
                       type="button"
-                      onClick={() => playerRef.current?.togglePlay()}
+                      onClick={handleTogglePlay}
                       className="flex h-12 w-12 items-center justify-center rounded-full bg-white text-black shadow-lg transition active:scale-95 hover:bg-zinc-200"
                     >
                       {isPlaying ? (
@@ -750,9 +1376,9 @@ export default function App() {
 
                     <button
                       type="button"
-                      onClick={handleNextVideo}
+                      onClick={handleNextTrack}
                       disabled={queue.length < 2}
-                      title="Next Video"
+                      title="Next Lecture"
                       className="rounded-full p-2 text-zinc-400 transition hover:bg-obsidian-800 hover:text-white disabled:opacity-30"
                     >
                       <SkipForward className="h-4 w-4" />
@@ -804,11 +1430,19 @@ export default function App() {
               <QueuePanel
                 queue={queue}
                 history={history}
-                activeVideoId={activeVideoId}
+                activeItemId={activeItemId}
+                isOnline={isOnline}
+                sidecarConfigured={sidecarConfigured}
+                fallbackConverterUrl={fallbackConverterUrl}
+                extractingItemId={extractingItemId}
                 onSelectVideo={handleSelectVideo}
                 onRemoveFromQueue={handleRemoveFromQueue}
                 onDeleteHistoryItem={handleDeleteHistoryItem}
+                onDeleteLocalFile={handleDeleteLocalFile}
                 onMoveQueueItem={handleMoveQueueItem}
+                onReplaceWithLocalFile={handleReplaceWithLocalFile}
+                onFetchViaSidecar={handleFetchViaSidecar}
+                onNotify={showNotice}
               />
             </div>
           </div>
@@ -828,10 +1462,10 @@ export default function App() {
                 hasPrev={queue.length > 1}
                 hasNext={queue.length > 1}
                 lastSignal={lastSignal}
-                onTogglePlay={() => playerRef.current?.togglePlay()}
+                onTogglePlay={handleTogglePlay}
                 onSeekRelative={handleSeekRelative}
-                onPrevVideo={handlePrevVideo}
-                onNextVideo={handleNextVideo}
+                onPrevVideo={handlePrevTrack}
+                onNextVideo={handleNextTrack}
                 onChangeInterval={(sec) => {
                   setSeekInterval(sec);
                   syncSettingsToServer({ seekInterval: sec });
@@ -843,25 +1477,32 @@ export default function App() {
                 onTestSignal={triggerTestSignal}
               />
 
-              {/* Keep YouTube Player mounted in Car Mode (Audio-Only friendly) */}
-              {activeVideoId && (
+              {/* Keep Unified Player mounted in Car Mode (Audio-Only friendly) */}
+              {activeItem && (
                 <div className="overflow-hidden rounded-2xl">
                   <VideoPlayer
                     ref={playerRef}
-                    videoId={activeVideoId.startsWith('playlist:') ? null : activeVideoId}
-                    playlistId={activePlaylistId}
-                    title={activeItem?.title}
-                    initialTime={activeItem?.lastPosition || 0}
+                    source={activeItem}
+                    initialTime={activeItem.lastPosition || 0}
                     playbackSpeed={playbackSpeed}
                     seekInterval={seekInterval}
                     audioOnlyMode={true}
                     theaterMode={false}
-                    onStateChange={(playing) => setIsPlaying(playing)}
+                    isOnline={isOnline}
+                    sidecarUrl={sidecarUrl}
+                    sidecarApiKey={sidecarApiKey}
+                    fallbackConverterUrl={fallbackConverterUrl}
+                    extractingItemId={extractingItemId}
+                    extractProgress={extractProgress}
+                    onStateChange={handlePlayerStateChange}
                     onTimeUpdate={(cur, dur) => {
                       setCurrentTime(cur);
                       if (dur > 0) setDuration(dur);
                     }}
                     onProgressSave={handleProgressSave}
+                    onReplaceWithLocalFile={handleReplaceWithLocalFile}
+                    onFetchViaSidecar={handleFetchViaSidecar}
+                    onNotify={showNotice}
                   />
                 </div>
               )}
@@ -871,11 +1512,19 @@ export default function App() {
               <QueuePanel
                 queue={queue}
                 history={history}
-                activeVideoId={activeVideoId}
+                activeItemId={activeItemId}
+                isOnline={isOnline}
+                sidecarConfigured={sidecarConfigured}
+                fallbackConverterUrl={fallbackConverterUrl}
+                extractingItemId={extractingItemId}
                 onSelectVideo={handleSelectVideo}
                 onRemoveFromQueue={handleRemoveFromQueue}
                 onDeleteHistoryItem={handleDeleteHistoryItem}
+                onDeleteLocalFile={handleDeleteLocalFile}
                 onMoveQueueItem={handleMoveQueueItem}
+                onReplaceWithLocalFile={handleReplaceWithLocalFile}
+                onFetchViaSidecar={handleFetchViaSidecar}
+                onNotify={showNotice}
               />
             </div>
           </div>
@@ -891,6 +1540,26 @@ export default function App() {
         </div>
       )}
 
+      {/* Status Toast (Playlist imports, Offline saves, Sidecar progress) */}
+      {statusToast && (
+        <div
+          className={`fixed bottom-16 left-1/2 z-40 flex -translate-x-1/2 items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold shadow-2xl backdrop-blur-md ${
+            statusToast.type === 'error'
+              ? 'border-red-500/40 bg-obsidian-900/95 text-red-300'
+              : statusToast.type === 'info'
+              ? 'border-sky-500/40 bg-obsidian-900/95 text-sky-300'
+              : 'border-emerald-500/40 bg-obsidian-900/95 text-emerald-300'
+          }`}
+        >
+          {statusToast.type === 'error' ? (
+            <AlertCircle className="h-4 w-4 shrink-0" />
+          ) : (
+            <CheckCircle2 className="h-4 w-4 shrink-0" />
+          )}
+          <span>{statusToast.text}</span>
+        </div>
+      )}
+
       {/* Settings Modal */}
       <SettingsModal
         isOpen={settingsOpen}
@@ -900,28 +1569,53 @@ export default function App() {
         doubleTapWindow={doubleTapWindow}
         workspaceId={workspaceId}
         dbConnected={dbConnected}
+        sidecarUrl={sidecarUrl}
+        sidecarApiKey={sidecarApiKey}
+        fallbackConverterUrl={fallbackConverterUrl}
+        onClearOfflineMedia={handleClearOfflineMedia}
         onSave={(next) => {
           setSeekInterval(next.seekInterval);
           setDoubleTapToSkip(next.doubleTapToSkip);
           setDoubleTapWindow(next.doubleTapWindow);
           setWorkspaceId(next.workspaceId);
-          syncSettingsToServer(next);
+          setSidecarUrl(next.sidecarUrl || '');
+          setSidecarApiKey(next.sidecarApiKey || '');
+          setFallbackConverterUrl(next.fallbackConverterUrl || DEFAULT_FALLBACK_CONVERTER_URL);
+          syncSettingsToServer({
+            seekInterval: next.seekInterval,
+            doubleTapToSkip: next.doubleTapToSkip,
+            doubleTapWindow: next.doubleTapWindow,
+            workspaceId: next.workspaceId,
+            sidecarUrl: next.sidecarUrl || '',
+            sidecarApiKey: next.sidecarApiKey || '',
+            fallbackConverterUrl: next.fallbackConverterUrl || DEFAULT_FALLBACK_CONVERTER_URL,
+          });
         }}
       />
     </div>
   );
 }
 
-function EmptyPlayerCard() {
+function EmptyPlayerCard({ onImportClick }) {
   return (
     <div className="flex aspect-video w-full flex-col items-center justify-center rounded-2xl border border-dashed border-zinc-800 bg-obsidian-900/60 p-8 text-center">
       <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-amber-500/10 ring-1 ring-amber-500/30">
         <Play className="ml-1 h-7 w-7 text-amber-400" />
       </div>
-      <h2 className="text-lg font-bold text-white">Paste a YouTube Lecture to Start</h2>
+      <h2 className="text-lg font-bold text-white">Paste a Lecture URL or Import Local Media</h2>
       <p className="mt-1.5 max-w-md text-xs leading-relaxed text-zinc-400">
-        Your Bluetooth earbuds & steering wheel Back/Forward buttons will scrub by your chosen interval instead of skipping videos.
+        Supports YouTube videos & playlists, Vimeo, direct MP4/MP3 links, and offline local files — with identical Car, Study, Theater & Bluetooth AVRCP controls.
       </p>
+      {onImportClick && (
+        <button
+          type="button"
+          onClick={onImportClick}
+          className="mt-4 inline-flex items-center gap-2 rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-4 py-2 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-500/20"
+        >
+          <Upload className="h-3.5 w-3.5" />
+          Import Local MP4 / MP3 (or Drag & Drop)
+        </button>
+      )}
     </div>
   );
 }

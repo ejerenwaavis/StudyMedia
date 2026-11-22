@@ -2,8 +2,11 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 
 /**
  * Generates a 1-second silent PCM WAV Blob URL in memory.
- * Used to anchor OS-level MediaSession focus to the parent StudyMedia window
- * so the YouTube iframe cannot hijack Bluetooth/steering-wheel AVRCP buttons.
+ * Used ONLY for iframe-based adapters ('youtube' | 'vimeo') to anchor OS-level
+ * MediaSession focus to the parent StudyMedia window so iframes cannot hijack
+ * Bluetooth/steering-wheel AVRCP buttons.
+ * Disabled for native HTML5 adapters ('local' | 'direct') so <video>/<audio>
+ * owns navigator.mediaSession directly for superior lock-screen/background playback.
  */
 function createSilentWavUrl() {
   const sampleRate = 8000;
@@ -21,9 +24,9 @@ function createSilentWavUrl() {
   view.setUint32(4, 36 + numSamples * 2, true);
   writeString(8, 'WAVE');
   writeString(12, 'fmt ');
-  view.setUint32(16, 16, true); // PCM chunk size
-  view.setUint16(20, 1, true); // PCM format
-  view.setUint16(22, 1, true); // Mono
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
   view.setUint32(24, sampleRate, true);
   view.setUint32(28, sampleRate * 2, true);
   view.setUint16(32, 2, true);
@@ -31,17 +34,17 @@ function createSilentWavUrl() {
   writeString(36, 'data');
   view.setUint32(40, numSamples * 2, true);
 
-  // Samples remain all zeros (complete silence)
   const blob = new Blob([buffer], { type: 'audio/wav' });
   return URL.createObjectURL(blob);
 }
 
 /**
- * Intercepts navigator.mediaSession AVRCP signals (previoustrack, nexttrack,
- * seekbackward, seekforward, play, pause) and remaps them to interval seeking
- * or double-tap video skipping.
+ * Unified Hardware MediaSession hook with Conditional Silent Audio Lock.
+ * Binds exclusively to the canonical PlayerController actions (seekRelative,
+ * togglePlay/play/pause, nextTrack, prevTrack) identically across all adapters.
  */
 export function useMediaSession({
+  sourceType = 'youtube',
   isPlaying,
   title,
   thumbnail,
@@ -52,17 +55,21 @@ export function useMediaSession({
   doubleTapToSkip = true,
   doubleTapWindow = 450,
   onSeekRelative,
-  onNextVideo,
-  onPrevVideo,
+  onNextTrack,
+  onPrevTrack,
+  onTogglePlay,
   onPlay,
   onPause,
 }) {
   const audioRef = useRef(null);
   const wavUrlRef = useRef(null);
-  const [sessionLockActive, setSessionLockActive] = useState(false);
+  const [silentLockPlaying, setSilentLockPlaying] = useState(false);
   const [lastSignal, setLastSignal] = useState(null);
 
-  // Tap timers for single-tap vs double-tap detection
+  const isIframeSource = sourceType === 'youtube' || sourceType === 'vimeo';
+  const isNativeSource = sourceType === 'local' || sourceType === 'direct';
+
+  // Tap timers for single-tap (±seekInterval) vs double-tap (skip queue item)
   const prevTapTimerRef = useRef(null);
   const nextTapTimerRef = useRef(null);
 
@@ -73,8 +80,9 @@ export function useMediaSession({
     doubleTapToSkip,
     doubleTapWindow,
     onSeekRelative,
-    onNextVideo,
-    onPrevVideo,
+    onNextTrack,
+    onPrevTrack,
+    onTogglePlay,
     onPlay,
     onPause,
   };
@@ -84,17 +92,22 @@ export function useMediaSession({
       id: Date.now() + Math.random(),
       type,
       detail,
-      timestamp: new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      timestamp: new Date().toLocaleTimeString([], {
+        hour12: false,
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      }),
     });
   }, []);
 
-  // Initialize hidden looping silent audio element
+  // Initialize hidden looping silent audio element once
   useEffect(() => {
     const url = createSilentWavUrl();
     wavUrlRef.current = url;
     const audio = new Audio(url);
     audio.loop = true;
-    audio.volume = 0.001; // Near-zero; WAV is digital silence anyway
+    audio.volume = 0.001;
     audio.setAttribute('playsinline', '');
     audioRef.current = audio;
 
@@ -109,19 +122,31 @@ export function useMediaSession({
     };
   }, []);
 
-  // Sync silent audio playback with YouTube player state
+  // Conditional Silent Audio Lock:
+  // Active ONLY when sourceType is 'youtube' or 'vimeo' AND playing.
+  // Disabled immediately for 'local' or 'direct' HTML5 sources so native media owns MediaSession.
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
 
-    if (isPlaying) {
+    if (isIframeSource && isPlaying) {
       audio
         .play()
-        .then(() => setSessionLockActive(true))
-        .catch(() => setSessionLockActive(false));
+        .then(() => setSilentLockPlaying(true))
+        .catch(() => setSilentLockPlaying(false));
     } else {
       audio.pause();
-      setSessionLockActive(false);
+      setSilentLockPlaying(false);
+    }
+  }, [isIframeSource, isPlaying]);
+
+  // Sync OS MediaSession playbackState
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    try {
+      navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+    } catch {
+      // ignore
     }
   }, [isPlaying]);
 
@@ -129,10 +154,19 @@ export function useMediaSession({
   useEffect(() => {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
 
+    const sourceBadge =
+      sourceType === 'local'
+        ? 'Offline'
+        : sourceType === 'vimeo'
+        ? 'Vimeo'
+        : sourceType === 'direct'
+        ? 'Direct'
+        : 'YouTube';
+
     try {
       navigator.mediaSession.metadata = new MediaMetadata({
         title: title || 'StudyMedia Lecture',
-        artist: `StudyMedia • ±${seekInterval}s Scrub`,
+        artist: `StudyMedia (${sourceBadge}) • ±${seekInterval}s Scrub`,
         album: `${playbackSpeed}x Speed`,
         artwork: thumbnail
           ? [
@@ -144,13 +178,13 @@ export function useMediaSession({
     } catch {
       // Ignore metadata errors on unsupported browsers
     }
-  }, [title, thumbnail, seekInterval, playbackSpeed]);
+  }, [title, thumbnail, seekInterval, playbackSpeed, sourceType]);
 
   // Update MediaSession position state
   useEffect(() => {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
     if (typeof navigator.mediaSession.setPositionState !== 'function') return;
-    if (!duration || duration <= 0) return;
+    if (!duration || duration <= 0 || !Number.isFinite(duration)) return;
 
     try {
       navigator.mediaSession.setPositionState({
@@ -163,13 +197,18 @@ export function useMediaSession({
     }
   }, [duration, currentTime, playbackSpeed]);
 
-  // Register MediaSession hardware action handlers
+  // Register MediaSession hardware action handlers (identical across all adapters)
   useEffect(() => {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
 
     const handlePrevTrack = () => {
-      const { seekInterval: interval, doubleTapToSkip: canSkip, doubleTapWindow: windowMs, onSeekRelative: seek, onPrevVideo: prevVid } =
-        callbacksRef.current;
+      const {
+        seekInterval: interval,
+        doubleTapToSkip: canSkip,
+        doubleTapWindow: windowMs,
+        onSeekRelative: seek,
+        onPrevTrack: prevTrack,
+      } = callbacksRef.current;
 
       if (!canSkip) {
         emitSignal('previoustrack', `Rewind -${interval}s`);
@@ -180,8 +219,8 @@ export function useMediaSession({
       if (prevTapTimerRef.current) {
         clearTimeout(prevTapTimerRef.current);
         prevTapTimerRef.current = null;
-        emitSignal('double-tap-prev', 'Previous Video in Queue');
-        prevVid?.();
+        emitSignal('double-tap-prev', 'Previous Lecture in Queue');
+        prevTrack?.();
       } else {
         prevTapTimerRef.current = setTimeout(() => {
           prevTapTimerRef.current = null;
@@ -192,8 +231,13 @@ export function useMediaSession({
     };
 
     const handleNextTrack = () => {
-      const { seekInterval: interval, doubleTapToSkip: canSkip, doubleTapWindow: windowMs, onSeekRelative: seek, onNextVideo: nextVid } =
-        callbacksRef.current;
+      const {
+        seekInterval: interval,
+        doubleTapToSkip: canSkip,
+        doubleTapWindow: windowMs,
+        onSeekRelative: seek,
+        onNextTrack: nextTrack,
+      } = callbacksRef.current;
 
       if (!canSkip) {
         emitSignal('nexttrack', `Forward +${interval}s`);
@@ -204,8 +248,8 @@ export function useMediaSession({
       if (nextTapTimerRef.current) {
         clearTimeout(nextTapTimerRef.current);
         nextTapTimerRef.current = null;
-        emitSignal('double-tap-next', 'Next Video in Queue');
-        nextVid?.();
+        emitSignal('double-tap-next', 'Next Lecture in Queue');
+        nextTrack?.();
       } else {
         nextTapTimerRef.current = setTimeout(() => {
           nextTapTimerRef.current = null;
@@ -229,12 +273,20 @@ export function useMediaSession({
 
     const handlePlay = () => {
       emitSignal('play', 'Resume Playback');
-      callbacksRef.current.onPlay?.();
+      if (callbacksRef.current.onPlay) {
+        callbacksRef.current.onPlay();
+      } else {
+        callbacksRef.current.onTogglePlay?.();
+      }
     };
 
     const handlePause = () => {
       emitSignal('pause', 'Pause Playback');
-      callbacksRef.current.onPause?.();
+      if (callbacksRef.current.onPause) {
+        callbacksRef.current.onPause();
+      } else {
+        callbacksRef.current.onTogglePlay?.();
+      }
     };
 
     const actions = [
@@ -265,7 +317,6 @@ export function useMediaSession({
     };
   }, [emitSignal]);
 
-  // Manual trigger for testing hardware signals in UI
   const triggerTestSignal = useCallback(
     (direction) => {
       if (direction === 'prev') {
@@ -279,8 +330,18 @@ export function useMediaSession({
     [emitSignal, onSeekRelative, seekInterval]
   );
 
+  // Derived lock mode for header indicator
+  const sessionLockMode = isNativeSource
+    ? isPlaying
+      ? 'native'
+      : 'standby'
+    : silentLockPlaying
+    ? 'silent-lock'
+    : 'standby';
+
   return {
-    sessionLockActive,
+    sessionLockActive: sessionLockMode !== 'standby',
+    sessionLockMode,
     lastSignal,
     triggerTestSignal,
   };
