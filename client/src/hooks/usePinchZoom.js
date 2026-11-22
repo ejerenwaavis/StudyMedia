@@ -46,6 +46,7 @@ export function usePinchZoom({
 
   const singleTapTimerRef = useRef(null);
   const lastTapRef = useRef({ time: 0, x: 0, y: 0 });
+  const lastTouchTimeRef = useRef(0);
   const gestureRef = useRef({
     mode: 'none', // 'none' | 'pinch' | 'pan' | 'mouse-pan' | 'tap-candidate'
     startScale: 1,
@@ -184,10 +185,11 @@ export function usePinchZoom({
     if (!overlay || !enabled) return;
 
     const handleTouchStart = (e) => {
-      callbacksRef.current.onActivity?.();
+      lastTouchTimeRef.current = Date.now();
 
       if (e.touches.length === 2) {
         e.preventDefault();
+        callbacksRef.current.onActivity?.();
         clearTimeout(singleTapTimerRef.current);
         const mid = getTouchMidpoint(e.touches[0], e.touches[1]);
         gestureRef.current = {
@@ -275,6 +277,7 @@ export function usePinchZoom({
     };
 
     const handleTouchEnd = (e) => {
+      lastTouchTimeRef.current = Date.now();
       const g = gestureRef.current;
 
       // Seamless handoff from 2-finger pinch to 1-finger pan without jump
@@ -344,10 +347,10 @@ export function usePinchZoom({
       zoomAtPoint(nextScale, e.clientX, e.clientY, false);
     };
 
-    // Desktop Mouse Pan & Click / Double-Click
+    // Desktop Mouse Pan & Click / Double-Click (strictly ignored after touch to prevent ghost mouse events)
     const handleMouseDown = (e) => {
       if (e.button !== 0) return;
-      callbacksRef.current.onActivity?.();
+      if (Date.now() - lastTouchTimeRef.current < 700) return;
       gestureRef.current = {
         mode: transformRef.current.scale > 1.01 ? 'mouse-pan' : 'tap-candidate',
         startScale: transformRef.current.scale,
@@ -363,6 +366,7 @@ export function usePinchZoom({
     };
 
     const handleWindowMouseMove = (e) => {
+      if (Date.now() - lastTouchTimeRef.current < 700) return;
       const g = gestureRef.current;
       if (g.mode !== 'mouse-pan' && g.mode !== 'tap-candidate') return;
       if ((e.buttons & 1) === 0) return;
@@ -385,6 +389,7 @@ export function usePinchZoom({
     };
 
     const handleWindowMouseUp = (e) => {
+      if (Date.now() - lastTouchTimeRef.current < 700) return;
       const g = gestureRef.current;
       if (g.mode !== 'mouse-pan' && g.mode !== 'tap-candidate') return;
 

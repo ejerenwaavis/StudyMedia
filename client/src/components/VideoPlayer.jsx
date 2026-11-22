@@ -74,7 +74,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
   const [playerState, setPlayerState] = useState('paused');
   const [currentTime, setCurrentTime] = useState(initialTime || 0);
   const [duration, setDuration] = useState(source?.duration || 0);
-  const [controlsVisible, setControlsVisible] = useState(true);
+  const [hudVisible, setHudVisible] = useState(true);
   const [playerError, setPlayerError] = useState(null);
   const [copiedUrl, setCopiedUrl] = useState(false);
   const [retryToken, setRetryToken] = useState(0);
@@ -88,11 +88,16 @@ const VideoPlayer = forwardRef(function VideoPlayer(
   const [sidecarHealth, setSidecarHealth] = useState('idle');
   const [sidecarFormat, setSidecarFormat] = useState('mp4');
 
-  const fadeTimerRef = useRef(null);
+  const hudTimerRef = useRef(null);
   const isPlaying = playerState === 'playing';
   const isFullscreen = isNativeFullscreen || isCssFullscreen;
   const isExtracting = Boolean(extractingItemId && source?.id === extractingItemId);
   const sidecarConfigured = Boolean(sidecarUrl?.trim() && sidecarApiKey?.trim());
+
+  const hudVisibleRef = useRef(hudVisible);
+  hudVisibleRef.current = hudVisible;
+  const isPlayingRef = useRef(isPlaying);
+  isPlayingRef.current = isPlaying;
 
   const latestPropsRef = useRef({});
   latestPropsRef.current = {
@@ -103,39 +108,65 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     onProgressSave,
   };
 
-  // Auto-fade controls in Theater or Fullscreen Mode after 3 seconds of inactivity
-  const resetFadeTimer = useCallback(() => {
-    setControlsVisible(true);
-    clearTimeout(fadeTimerRef.current);
-    if (theaterMode || isFullscreen) {
-      fadeTimerRef.current = setTimeout(() => {
-        setControlsVisible(false);
-      }, 3000);
-    }
-  }, [theaterMode, isFullscreen]);
+  // Single canonical helper to show HUD and schedule 3.5s auto-hide (while playing)
+  const showHud = useCallback(
+    (durationMs = 3500) => {
+      setHudVisible(true);
+      clearTimeout(hudTimerRef.current);
+      hudTimerRef.current = null;
+      if (theaterMode || isFullscreen) {
+        hudTimerRef.current = setTimeout(() => {
+          hudTimerRef.current = null;
+          if (isPlayingRef.current) {
+            setHudVisible(false);
+          }
+        }, durationMs);
+      }
+    },
+    [theaterMode, isFullscreen]
+  );
 
+  const hideHud = useCallback(() => {
+    clearTimeout(hudTimerRef.current);
+    hudTimerRef.current = null;
+    setHudVisible(false);
+  }, []);
+
+  // Immediately show HUD for 3.5s whenever fullscreen or theater mode is entered
   useEffect(() => {
-    resetFadeTimer();
-    return () => clearTimeout(fadeTimerRef.current);
-  }, [theaterMode, isFullscreen, resetFadeTimer]);
+    showHud(3500);
+    return () => {
+      clearTimeout(hudTimerRef.current);
+      hudTimerRef.current = null;
+    };
+  }, [theaterMode, isFullscreen, showHud]);
 
-  // Single-tap handler from usePinchZoom (debounced past double-tap window):
-  // - In Fullscreen or Theater: toggle HUD visibility
+  // Keep HUD visible while paused; restart 3.5s auto-hide countdown when playback resumes
+  useEffect(() => {
+    if (!theaterMode && !isFullscreen) return;
+    if (!isPlaying) {
+      clearTimeout(hudTimerRef.current);
+      hudTimerRef.current = null;
+      setHudVisible(true);
+    } else if (hudVisibleRef.current) {
+      showHud(3500);
+    }
+  }, [isPlaying, theaterMode, isFullscreen, showHud]);
+
+  // Single-tap handler from usePinchZoom (fires strictly once per tap, debounced past double-tap):
+  // - In Fullscreen or Theater: show for 3.5s if hidden, hide immediately if visible
   // - In Study Mode: toggle Play/Pause
   const handleSingleTap = useCallback(() => {
     if (isFullscreen || theaterMode) {
-      setControlsVisible((prev) => {
-        const next = !prev;
-        clearTimeout(fadeTimerRef.current);
-        if (next) {
-          fadeTimerRef.current = setTimeout(() => setControlsVisible(false), 3000);
-        }
-        return next;
-      });
+      if (hudVisibleRef.current) {
+        hideHud();
+      } else {
+        showHud(3500);
+      }
     } else {
       controllerRef.current?.togglePlay();
     }
-  }, [isFullscreen, theaterMode]);
+  }, [isFullscreen, theaterMode, showHud, hideHud]);
 
   // Pinch-to-Zoom (1x–4x) & Pan Hook (resets cleanly on track switch or fullscreen toggle)
   const gestureActive = !audioOnlyMode && !playerError && !interactMode;
@@ -145,7 +176,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     overlayRef,
     enabled: gestureActive,
     onSingleTap: handleSingleTap,
-    onActivity: resetFadeTimer,
+    onActivity: () => showHud(3500),
     resetKey: `${source?.id || ''}|${isFullscreen}|${audioOnlyMode}`,
   });
 
@@ -436,8 +467,12 @@ const VideoPlayer = forwardRef(function VideoPlayer(
   return (
     <div
       ref={stageRef}
-      onMouseMove={resetFadeTimer}
-      onTouchStart={resetFadeTimer}
+      onMouseMove={(e) => {
+        // Desktop pointer movement only (never fires prematurely from mobile touchstart)
+        if ((isFullscreen || theaterMode) && (e.movementX !== 0 || e.movementY !== 0)) {
+          showHud(3500);
+        }
+      }}
       className={`overflow-hidden bg-black shadow-2xl transition-all duration-300 ${
         isCssFullscreen
           ? 'fixed inset-0 z-50 h-[100dvh] w-screen rounded-none border-0'
@@ -500,20 +535,31 @@ const VideoPlayer = forwardRef(function VideoPlayer(
       {/* Top-Right Floating Controls: Zoom HUD Pill & Native Controls "Interact" Escape Hatch (z-20) */}
       {showFloatingHud && (
         <div
+          onPointerDown={(e) => {
+            e.stopPropagation();
+            showHud(3500);
+          }}
+          onTouchStart={(e) => {
+            e.stopPropagation();
+            showHud(3500);
+          }}
           onClick={(e) => e.stopPropagation()}
-          className={`absolute right-3 top-3 z-20 flex items-center gap-2 transition-opacity duration-300 ${
-            (isFullscreen || theaterMode) && !controlsVisible && !isZoomed && !interactMode
+          className={`absolute right-3 top-3 z-20 flex items-center gap-2 transition-opacity duration-200 ${
+            (isFullscreen || theaterMode) && !hudVisible && !isZoomed && !interactMode
               ? 'pointer-events-none opacity-0'
               : 'opacity-100'
           }`}
         >
           {/* Live Zoom Level Pill + One-Tap Reset (visible whenever scale > 1.05) */}
           {isZoomed && (
-            <div className="flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-black/75 px-2.5 py-1 text-xs font-bold text-amber-300 backdrop-blur-md">
+            <div className="flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-black/50 px-2.5 py-1 text-xs font-bold text-amber-300 backdrop-blur-sm">
               <span className="font-mono">{zoomLevel.toFixed(1)}x</span>
               <button
                 type="button"
-                onClick={() => resetZoom(true)}
+                onClick={() => {
+                  resetZoom(true);
+                  showHud(3500);
+                }}
                 className="flex items-center gap-1 rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-bold text-amber-200 transition hover:bg-amber-500/35"
               >
                 <ResetIcon className="h-3 w-3" />
@@ -527,17 +573,17 @@ const VideoPlayer = forwardRef(function VideoPlayer(
             type="button"
             onClick={() => {
               setInteractMode((prev) => !prev);
-              resetFadeTimer();
+              showHud(3500);
             }}
             title={
               interactMode
                 ? 'Pass-through active: tap to return to Pinch-Zoom & Pan mode'
                 : 'Interact Mode: temporarily pass taps through to YouTube/Vimeo CC, quality & settings'
             }
-            className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1.5 text-[11px] font-semibold backdrop-blur-md transition ${
+            className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1.5 text-[11px] font-semibold backdrop-blur-sm transition ${
               interactMode
                 ? 'border-amber-400 bg-amber-500 text-black shadow-lg'
-                : 'border-zinc-700/70 bg-black/65 text-zinc-200 hover:border-zinc-500 hover:bg-black/85 hover:text-white'
+                : 'border-white/15 bg-black/45 text-zinc-100 hover:border-white/30 hover:bg-black/65 hover:text-white'
             }`}
           >
             <Hand className="h-3.5 w-3.5" />
@@ -810,17 +856,25 @@ const VideoPlayer = forwardRef(function VideoPlayer(
         </div>
       )}
 
-      {/* Auto-Hiding Bottom HUD for Fullscreen & Theater Modes */}
+      {/* Semi-Transparent Auto-Hiding Bottom HUD for Fullscreen & Theater Modes */}
       {showBottomHud && (
         <div
+          onPointerDown={(e) => {
+            e.stopPropagation();
+            showHud(3500);
+          }}
+          onTouchStart={(e) => {
+            e.stopPropagation();
+            showHud(3500);
+          }}
           onClick={(e) => e.stopPropagation()}
-          className={`absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-black/95 via-black/80 to-transparent px-4 pb-4 pt-12 transition-opacity duration-300 sm:px-5 ${
-            controlsVisible ? 'opacity-100' : 'pointer-events-none opacity-0'
+          className={`absolute inset-x-3 bottom-3 z-20 rounded-2xl border border-white/10 bg-black/45 px-4 py-3 backdrop-blur-sm transition-opacity duration-200 sm:inset-x-5 sm:bottom-4 ${
+            hudVisible ? 'opacity-100' : 'pointer-events-none opacity-0'
           }`}
         >
           {/* Amber Progress Bar */}
-          <div className="relative mb-3 flex items-center">
-            <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-700/70">
+          <div className="relative mb-2.5 flex items-center">
+            <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/20">
               <div
                 className="h-full rounded-full bg-amber-400 transition-all duration-200"
                 style={{ width: `${progressPct}%` }}
@@ -835,7 +889,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
                 const val = Number(e.target.value);
                 controllerRef.current?.seekTo(val);
                 setCurrentTime(val);
-                resetFadeTimer();
+                showHud(3500);
               }}
               className="study-scrubber absolute inset-0 h-full w-full opacity-0 hover:opacity-100"
             />
@@ -846,7 +900,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
               <p className="truncate text-sm font-semibold text-white">
                 {source?.title || 'Lecture Playing'}
               </p>
-              <p className="font-mono text-xs text-zinc-400">
+              <p className="font-mono text-xs text-zinc-300">
                 {formatTime(currentTime)} / {formatTime(duration)}
               </p>
             </div>
@@ -857,9 +911,9 @@ const VideoPlayer = forwardRef(function VideoPlayer(
                 type="button"
                 onClick={() => {
                   controllerRef.current?.seekRelative(-seekInterval);
-                  resetFadeTimer();
+                  showHud(3500);
                 }}
-                className="flex items-center gap-1 rounded-full bg-zinc-800/85 px-2.5 py-1.5 text-xs font-semibold text-zinc-100 hover:bg-zinc-700"
+                className="flex items-center gap-1 rounded-full border border-white/10 bg-black/45 px-2.5 py-1.5 text-xs font-semibold text-zinc-100 hover:bg-white/15"
               >
                 <RotateCcw className="h-3.5 w-3.5" />
                 {seekInterval}s
@@ -870,9 +924,9 @@ const VideoPlayer = forwardRef(function VideoPlayer(
                 type="button"
                 onClick={() => {
                   controllerRef.current?.togglePlay();
-                  resetFadeTimer();
+                  showHud(3500);
                 }}
-                className="flex h-10 w-10 items-center justify-center rounded-full bg-white text-black transition hover:scale-105"
+                className="flex h-10 w-10 items-center justify-center rounded-full bg-white/95 text-black transition hover:scale-105"
               >
                 {isPlaying ? <Pause className="h-5 w-5" /> : <Play className="ml-0.5 h-5 w-5" />}
               </button>
@@ -882,25 +936,25 @@ const VideoPlayer = forwardRef(function VideoPlayer(
                 type="button"
                 onClick={() => {
                   controllerRef.current?.seekRelative(seekInterval);
-                  resetFadeTimer();
+                  showHud(3500);
                 }}
-                className="flex items-center gap-1 rounded-full bg-zinc-800/85 px-2.5 py-1.5 text-xs font-semibold text-zinc-100 hover:bg-zinc-700"
+                className="flex items-center gap-1 rounded-full border border-white/10 bg-black/45 px-2.5 py-1.5 text-xs font-semibold text-zinc-100 hover:bg-white/15"
               >
                 {seekInterval}s
                 <RotateCw className="h-3.5 w-3.5" />
               </button>
 
               {/* Zoom Controls (- / Reset / +) */}
-              <div className="flex items-center gap-1 rounded-full border border-zinc-700/80 bg-zinc-900/85 p-0.5">
+              <div className="flex items-center gap-1 rounded-full border border-white/10 bg-black/45 p-0.5">
                 <button
                   type="button"
                   onClick={() => {
                     zoomOut();
-                    resetFadeTimer();
+                    showHud(3500);
                   }}
                   disabled={!isZoomed}
                   title="Zoom Out"
-                  className="rounded-full p-1.5 text-zinc-300 hover:bg-zinc-800 hover:text-white disabled:opacity-35"
+                  className="rounded-full p-1.5 text-zinc-200 hover:bg-white/15 hover:text-white disabled:opacity-35"
                 >
                   <ZoomOut className="h-3.5 w-3.5" />
                 </button>
@@ -909,25 +963,25 @@ const VideoPlayer = forwardRef(function VideoPlayer(
                     type="button"
                     onClick={() => {
                       resetZoom(true);
-                      resetFadeTimer();
+                      showHud(3500);
                     }}
                     title="Reset Zoom to 1x"
-                    className="rounded-full bg-amber-500/20 px-2 py-0.5 font-mono text-[11px] font-bold text-amber-300 hover:bg-amber-500/35"
+                    className="rounded-full bg-amber-500/25 px-2 py-0.5 font-mono text-[11px] font-bold text-amber-300 hover:bg-amber-500/40"
                   >
                     {zoomLevel.toFixed(1)}x
                   </button>
                 ) : (
-                  <span className="px-1 font-mono text-[11px] text-zinc-400">1.0x</span>
+                  <span className="px-1 font-mono text-[11px] text-zinc-300">1.0x</span>
                 )}
                 <button
                   type="button"
                   onClick={() => {
                     zoomIn();
-                    resetFadeTimer();
+                    showHud(3500);
                   }}
                   disabled={zoomLevel >= 4}
                   title="Zoom In"
-                  className="rounded-full p-1.5 text-zinc-300 hover:bg-zinc-800 hover:text-white disabled:opacity-35"
+                  className="rounded-full p-1.5 text-zinc-200 hover:bg-white/15 hover:text-white disabled:opacity-35"
                 >
                   <ZoomIn className="h-3.5 w-3.5" />
                 </button>
@@ -938,19 +992,19 @@ const VideoPlayer = forwardRef(function VideoPlayer(
                 type="button"
                 onClick={() => {
                   setInteractMode((prev) => !prev);
-                  resetFadeTimer();
+                  showHud(3500);
                 }}
                 title="Toggle Native Player Pass-Through"
-                className={`rounded-lg p-2 transition ${
+                className={`rounded-lg border p-2 transition ${
                   interactMode
-                    ? 'bg-amber-500 text-black'
-                    : 'bg-zinc-800/85 text-zinc-300 hover:bg-zinc-700 hover:text-white'
+                    ? 'border-amber-400 bg-amber-500 text-black'
+                    : 'border-white/10 bg-black/45 text-zinc-200 hover:bg-white/15 hover:text-white'
                 }`}
               >
                 <Hand className="h-4 w-4" />
               </button>
 
-              <span className="hidden rounded-full border border-zinc-700 bg-zinc-800/90 px-2.5 py-1 font-mono text-xs font-medium text-zinc-200 sm:inline-block">
+              <span className="hidden rounded-full border border-white/10 bg-black/45 px-2.5 py-1 font-mono text-xs font-medium text-zinc-200 sm:inline-block">
                 {playbackSpeed}x
               </span>
 
@@ -960,7 +1014,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
                   type="button"
                   onClick={handleToggleFullscreen}
                   title="Exit Fullscreen"
-                  className="rounded-lg bg-zinc-800/85 p-2 text-zinc-200 hover:bg-zinc-700 hover:text-white"
+                  className="rounded-lg border border-white/10 bg-black/45 p-2 text-zinc-100 hover:bg-white/15 hover:text-white"
                 >
                   <Minimize2 className="h-4 w-4" />
                 </button>
@@ -970,7 +1024,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
                     type="button"
                     onClick={handleToggleFullscreen}
                     title="Enter Fullscreen"
-                    className="rounded-lg bg-zinc-800/85 p-2 text-zinc-200 hover:bg-zinc-700 hover:text-white"
+                    className="rounded-lg border border-white/10 bg-black/45 p-2 text-zinc-100 hover:bg-white/15 hover:text-white"
                   >
                     <Maximize2 className="h-4 w-4" />
                   </button>
@@ -979,7 +1033,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
                       type="button"
                       onClick={onExitTheater}
                       title="Exit Theater Mode"
-                      className="rounded-lg bg-zinc-800/85 p-2 text-zinc-300 hover:bg-zinc-700 hover:text-white"
+                      className="rounded-lg border border-white/10 bg-black/45 p-2 text-zinc-200 hover:bg-white/15 hover:text-white"
                     >
                       <Minimize2 className="h-4 w-4" />
                     </button>
