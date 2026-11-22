@@ -376,6 +376,7 @@ exports.updateSettings = async (req, res) => {
       'sidecarUrl',
       'sidecarApiKey',
       'fallbackConverterUrl',
+      'playlists',
     ];
     const update = {};
     for (const key of allowedFields) {

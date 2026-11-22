@@ -57,6 +57,10 @@ const userSettingsSchema = new mongoose.Schema(
       type: String,
       default: 'https://ytmp3.gl/',
     },
+    playlists: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
   },
   { timestamps: true }
 );

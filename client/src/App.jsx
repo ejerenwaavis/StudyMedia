@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { arrayMove } from '@dnd-kit/sortable';
 import {
   Play,
   Pause,
@@ -26,6 +27,7 @@ import {
   AlertCircle,
   HardDrive,
   RefreshCw,
+  ListPlus,
 } from 'lucide-react';
 import VideoPlayer from './components/VideoPlayer';
 import QueuePanel from './components/QueuePanel';
@@ -55,22 +57,93 @@ import {
   saveSidecarConfig,
   DEFAULT_FALLBACK_CONVERTER_URL,
 } from './utils/sidecarClient';
+import { SequentialPlaylistDownloader } from './utils/playlistDownloader';
 
 const STORAGE_KEY = 'studymedia_state_v1';
+const DEFAULT_PLAYLIST_ID = 'default';
 const INTERVAL_PRESETS = [5, 10, 15, 30, 60];
 const SPEED_OPTIONS = [0.75, 1, 1.25, 1.5, 1.75, 2];
 
+function createDefaultPlaylist(items = []) {
+  return {
+    id: DEFAULT_PLAYLIST_ID,
+    name: 'Study Queue',
+    createdAt: Date.now(),
+    items,
+  };
+}
+
+function normalizePlaylists(rawPlaylists) {
+  if (!Array.isArray(rawPlaylists) || rawPlaylists.length === 0) return null;
+  const cleaned = rawPlaylists
+    .filter((pl) => pl && typeof pl === 'object')
+    .map((pl, idx) => ({
+      id: String(pl.id || `pl_${Date.now()}_${idx}`),
+      name: String(pl.name || (idx === 0 ? 'Study Queue' : `Playlist ${idx + 1}`)).trim() || 'Study Queue',
+      createdAt: Number(pl.createdAt) || Date.now(),
+      items: Array.isArray(pl.items)
+        ? pl.items.map(normalizeQueueItem).filter(Boolean)
+        : [],
+    }));
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+/**
+ * Load state from localStorage and cleanly migrate any legacy flat `items` queue
+ * into the new named `playlists` array without losing any items or timestamps.
+ */
 function loadLocalState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed?.items)) {
-      parsed.items = parsed.items.map(normalizeQueueItem).filter(Boolean);
+    if (!raw) {
+      return {
+        playlists: [createDefaultPlaylist([])],
+        activePlaylistId: DEFAULT_PLAYLIST_ID,
+        history: [],
+      };
     }
-    return parsed;
+
+    const parsed = JSON.parse(raw);
+
+    // Case 1: Already migrated to named playlists
+    const existingPlaylists = normalizePlaylists(parsed?.playlists);
+    if (existingPlaylists) {
+      const normalizedHistory = Array.isArray(parsed.history)
+        ? parsed.history.map(normalizeQueueItem).filter(Boolean)
+        : [];
+      const activePlaylistId = existingPlaylists.some((p) => p.id === parsed.activePlaylistId)
+        ? parsed.activePlaylistId
+        : existingPlaylists[0].id;
+
+      return {
+        ...parsed,
+        playlists: existingPlaylists,
+        activePlaylistId,
+        history: normalizedHistory,
+      };
+    }
+
+    // Case 2: Legacy flat `items` schema -> migrate cleanly into "Study Queue" playlist + history
+    const legacyItems = Array.isArray(parsed?.items)
+      ? parsed.items.map(normalizeQueueItem).filter(Boolean)
+      : [];
+
+    const queuedItems = legacyItems
+      .filter((i) => i.inQueue)
+      .sort((a, b) => (a.queueOrder ?? 0) - (b.queueOrder ?? 0));
+
+    return {
+      ...parsed,
+      playlists: [createDefaultPlaylist(queuedItems)],
+      activePlaylistId: DEFAULT_PLAYLIST_ID,
+      history: legacyItems,
+    };
   } catch {
-    return null;
+    return {
+      playlists: [createDefaultPlaylist([])],
+      activePlaylistId: DEFAULT_PLAYLIST_ID,
+      history: [],
+    };
   }
 }
 
@@ -79,7 +152,13 @@ export default function App() {
   const initialSidecar = useMemo(() => loadSidecarConfig(), []);
 
   const [workspaceId, setWorkspaceId] = useState(initialLocal?.workspaceId || 'default');
-  const [items, setItems] = useState(initialLocal?.items || []);
+  const [playlists, setPlaylists] = useState(
+    () => initialLocal?.playlists || [createDefaultPlaylist([])]
+  );
+  const [activePlaylistId, setActivePlaylistId] = useState(
+    () => initialLocal?.activePlaylistId || DEFAULT_PLAYLIST_ID
+  );
+  const [historyItems, setHistoryItems] = useState(() => initialLocal?.history || []);
   const [activeItemId, setActiveItemId] = useState(
     initialLocal?.activeItemId || initialLocal?.activeVideoId || null
   );
@@ -101,10 +180,25 @@ export default function App() {
 
   const [urlInput, setUrlInput] = useState('');
   const [urlError, setUrlError] = useState('');
+  const [playlistImportMode, setPlaylistImportMode] = useState('new'); // 'new' | 'append'
   const [isAddingUrl, setIsAddingUrl] = useState(false);
-  const [isImportingLocal, setIsImportingLocal] = useState(false);
+
+  // Multi-file sequential local import progress
+  const [localImportProgress, setLocalImportProgress] = useState(null); // null | { current, total, fileName }
+  const isImportingLocal = Boolean(localImportProgress);
+
+  // Single-item sidecar extraction state
   const [extractingItemId, setExtractingItemId] = useState(null);
   const [extractProgress, setExtractProgress] = useState(null);
+
+  // Sequential offline playlist download state
+  const [batchDownload, setBatchDownload] = useState(null);
+  const [batchErrors, setBatchErrors] = useState({});
+  const playlistDownloaderRef = useRef(null);
+  if (!playlistDownloaderRef.current) {
+    playlistDownloaderRef.current = new SequentialPlaylistDownloader();
+  }
+
   const [isRefreshingApp, setIsRefreshingApp] = useState(false);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
 
@@ -114,7 +208,7 @@ export default function App() {
   const [dbConnected, setDbConnected] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [showSignalToast, setShowSignalToast] = useState(false);
-  const [statusToast, setStatusToast] = useState(null); // { type: 'info'|'success'|'error', text }
+  const [statusToast, setStatusToast] = useState(null);
   const [installPrompt, setInstallPrompt] = useState(null);
 
   const playerRef = useRef(null);
@@ -130,44 +224,92 @@ export default function App() {
   const showNotice = useCallback((text, type = 'success') => {
     setStatusToast({ id: Date.now(), type, text });
     clearTimeout(statusToastTimerRef.current);
-    statusToastTimerRef.current = setTimeout(() => setStatusToast(null), 3600);
+    statusToastTimerRef.current = setTimeout(() => setStatusToast(null), 3800);
   }, []);
 
-  // Derived Queue & History
-  const queue = useMemo(
-    () =>
-      items
-        .filter((i) => i.inQueue)
-        .sort((a, b) => (a.queueOrder ?? 0) - (b.queueOrder ?? 0)),
-    [items]
+  // Derived active playlist, queue, history, and active playing item
+  const activePlaylist = useMemo(
+    () => playlists.find((p) => p.id === activePlaylistId) || playlists[0] || createDefaultPlaylist([]),
+    [playlists, activePlaylistId]
   );
+
+  const queue = activePlaylist.items;
 
   const history = useMemo(
     () =>
-      [...items].sort(
+      [...historyItems].sort(
         (a, b) => new Date(b.lastWatchedAt || 0).getTime() - new Date(a.lastWatchedAt || 0).getTime()
       ),
-    [items]
+    [historyItems]
   );
 
-  const activeItem = useMemo(
-    () => items.find((i) => (i.id || i.videoId) === activeItemId) || null,
-    [items, activeItemId]
-  );
+  // Resolve activeItem across active playlist -> all playlists -> history
+  // so browsing/reordering/switching playlists NEVER interrupts active playback
+  const activeItem = useMemo(() => {
+    if (!activeItemId) return null;
+    const inActive = queue.find((i) => (i.id || i.videoId) === activeItemId);
+    if (inActive) return inActive;
+    for (const pl of playlists) {
+      const found = pl.items.find((i) => (i.id || i.videoId) === activeItemId);
+      if (found) return found;
+    }
+    return historyItems.find((i) => (i.id || i.videoId) === activeItemId) || null;
+  }, [activeItemId, queue, playlists, historyItems]);
 
-  const activeQueueIndex = useMemo(
-    () => queue.findIndex((i) => (i.id || i.videoId) === activeItemId),
-    [queue, activeItemId]
-  );
+  // Playlist currently playing from (used by Next/Prev hardware & deck controls)
+  const playingPlaylistItems = useMemo(() => {
+    if (activeItemId) {
+      if (queue.some((i) => i.id === activeItemId)) return queue;
+      const owner = playlists.find((pl) => pl.items.some((i) => i.id === activeItemId));
+      if (owner) return owner.items;
+    }
+    return queue;
+  }, [activeItemId, queue, playlists]);
 
-  // Persist core state to localStorage (excluding raw blobs which live in IndexedDB)
+  const urlLooksLikePlaylist = useMemo(() => {
+    const trimmed = urlInput.trim();
+    if (!trimmed) return false;
+    return /[?&]list=[a-zA-Z0-9_-]{8,}/i.test(trimmed);
+  }, [urlInput]);
+
+  // Helper: update a single item consistently across ALL playlists and history
+  const updateItemAcrossAll = useCallback((itemId, updater) => {
+    setPlaylists((prev) =>
+      prev.map((pl) => ({
+        ...pl,
+        items: pl.items.map((item) =>
+          item.id === itemId ? updater(item) : item
+        ),
+      }))
+    );
+    setHistoryItems((prev) =>
+      prev.map((item) => (item.id === itemId ? updater(item) : item))
+    );
+  }, []);
+
+  // Helper: upsert items into watch history cleanly
+  const upsertHistoryItems = useCallback((incomingList) => {
+    if (!Array.isArray(incomingList) || incomingList.length === 0) return;
+    setHistoryItems((prev) => {
+      const map = new Map(prev.map((i) => [i.id, i]));
+      for (const item of incomingList) {
+        const existing = map.get(item.id);
+        map.set(item.id, existing ? { ...existing, ...item } : item);
+      }
+      return Array.from(map.values());
+    });
+  }, []);
+
+  // Persist named playlists & core state to localStorage immediately
   useEffect(() => {
     try {
       localStorage.setItem(
         STORAGE_KEY,
         JSON.stringify({
           workspaceId,
-          items,
+          playlists,
+          activePlaylistId,
+          history: historyItems,
           activeItemId,
           activeVideoId: activeItemId,
           mode,
@@ -183,7 +325,9 @@ export default function App() {
     }
   }, [
     workspaceId,
-    items,
+    playlists,
+    activePlaylistId,
+    historyItems,
     activeItemId,
     mode,
     seekInterval,
@@ -208,7 +352,7 @@ export default function App() {
     return () => window.removeEventListener('beforeinstallprompt', handler);
   }, []);
 
-  // Load state from MongoDB backend on mount or workspaceId change (merging safely with local IndexedDB items)
+  // Sync from MongoDB backend on mount / workspaceId change (safely preserving device-local offline items)
   useEffect(() => {
     if (!isOnline) return;
     let cancelled = false;
@@ -224,45 +368,6 @@ export default function App() {
         const data = await stateRes.json();
         if (cancelled || !data?.synced) return;
 
-        if (Array.isArray(data.items) && data.items.length > 0) {
-          const remoteNormalized = data.items.map(normalizeQueueItem).filter(Boolean);
-          setItems((prev) => {
-            const localById = new Map(prev.map((i) => [i.id, i]));
-            const merged = [];
-            const seen = new Set();
-
-            // Preserve local offline-ready upgrades if same ID exists locally
-            for (const remote of remoteNormalized) {
-              seen.add(remote.id);
-              const existing = localById.get(remote.id);
-              if (existing?.isOfflineReady) {
-                merged.push({
-                  ...remote,
-                  ...existing,
-                  lastPosition: Math.max(remote.lastPosition || 0, existing.lastPosition || 0),
-                });
-              } else {
-                merged.push(remote);
-              }
-            }
-
-            // Retain any device-local IndexedDB items not in MongoDB
-            for (const localItem of prev) {
-              if (!seen.has(localItem.id) && (localItem.isOfflineReady || localItem.sourceType === 'local')) {
-                merged.push(localItem);
-              }
-            }
-
-            return merged;
-          });
-
-          if (!activeItemId) {
-            const firstQueue = remoteNormalized.find((i) => i.inQueue) || remoteNormalized[0];
-            if (firstQueue) {
-              setActiveItemId(firstQueue.id);
-            }
-          }
-        }
         if (data.settings) {
           if (data.settings.seekInterval) setSeekInterval(data.settings.seekInterval);
           if (data.settings.playbackSpeed) setPlaybackSpeed(data.settings.playbackSpeed);
@@ -278,6 +383,36 @@ export default function App() {
             setSidecarApiKey(data.settings.sidecarApiKey);
           if (data.settings.fallbackConverterUrl)
             setFallbackConverterUrl(data.settings.fallbackConverterUrl);
+
+          const remotePlaylists = normalizePlaylists(data.settings.playlists);
+          if (remotePlaylists) {
+            setPlaylists((prev) => {
+              const localOfflineById = new Map();
+              for (const pl of prev) {
+                for (const item of pl.items) {
+                  if (item.isOfflineReady) localOfflineById.set(item.id, item);
+                }
+              }
+              return remotePlaylists.map((pl) => ({
+                ...pl,
+                items: pl.items.map((item) => {
+                  const localCopy = localOfflineById.get(item.id);
+                  return localCopy
+                    ? {
+                        ...item,
+                        ...localCopy,
+                        lastPosition: Math.max(item.lastPosition || 0, localCopy.lastPosition || 0),
+                      }
+                    : item;
+                }),
+              }));
+            });
+          }
+        }
+
+        if (Array.isArray(data.items) && data.items.length > 0) {
+          const remoteNormalized = data.items.map(normalizeQueueItem).filter(Boolean);
+          upsertHistoryItems(remoteNormalized);
         }
       } catch {
         // Offline or local-only fallback
@@ -301,6 +436,28 @@ export default function App() {
     [workspaceId, isOnline]
   );
 
+  // Sync non-local playlist structure to MongoDB when playlists change (debounced)
+  useEffect(() => {
+    if (!isOnline || !dbConnected) return;
+    const timer = setTimeout(() => {
+      const syncablePlaylists = playlists.map((pl) => ({
+        id: pl.id,
+        name: pl.name,
+        createdAt: pl.createdAt,
+        items: pl.items
+          .filter((i) => i.sourceType !== 'local' || i.sourceUrl)
+          .map((i) => ({
+            ...i,
+            // Never push local blob IDs to other devices
+            localBlobId: null,
+            isOfflineReady: false,
+          })),
+      }));
+      syncSettingsToServer({ playlists: syncablePlaylists });
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [playlists, isOnline, dbConnected, syncSettingsToServer]);
+
   const syncItemToServer = useCallback(
     (item) => {
       if (!isOnline || !item || item.sourceType === 'local' || item.id.startsWith('local:')) return;
@@ -319,19 +476,21 @@ export default function App() {
           thumbnail: item.thumbnail || '',
           duration: item.duration || 0,
           lastPosition: item.lastPosition || 0,
-          inQueue: item.inQueue,
-          queueOrder: item.queueOrder,
+          inQueue: true,
+          queueOrder: item.queueOrder || 0,
         }),
       }).catch(() => {});
     },
     [workspaceId, isOnline]
   );
 
-  // Navigation between queued lectures (respects offline mode by preferring playable items)
+  // Navigation between lectures in the active playing playlist (respects offline mode)
   const handleNextTrack = useCallback(() => {
-    if (queue.length === 0) return;
-    const playableQueue = isOnline ? queue : queue.filter((i) => i.isOfflineReady);
-    const list = playableQueue.length > 0 ? playableQueue : queue;
+    if (playingPlaylistItems.length === 0) return;
+    const playable = isOnline
+      ? playingPlaylistItems
+      : playingPlaylistItems.filter((i) => i.isOfflineReady);
+    const list = playable.length > 0 ? playable : playingPlaylistItems;
     const curIdx = list.findIndex((i) => i.id === activeItemId);
     const nextIdx = curIdx >= 0 ? (curIdx + 1) % list.length : 0;
     const next = list[nextIdx];
@@ -341,12 +500,14 @@ export default function App() {
         syncSettingsToServer({ activeVideoId: next.id });
       }
     }
-  }, [queue, isOnline, activeItemId, syncSettingsToServer]);
+  }, [playingPlaylistItems, isOnline, activeItemId, syncSettingsToServer]);
 
   const handlePrevTrack = useCallback(() => {
-    if (queue.length === 0) return;
-    const playableQueue = isOnline ? queue : queue.filter((i) => i.isOfflineReady);
-    const list = playableQueue.length > 0 ? playableQueue : queue;
+    if (playingPlaylistItems.length === 0) return;
+    const playable = isOnline
+      ? playingPlaylistItems
+      : playingPlaylistItems.filter((i) => i.isOfflineReady);
+    const list = playable.length > 0 ? playable : playingPlaylistItems;
     const curIdx = list.findIndex((i) => i.id === activeItemId);
     const prevIdx = curIdx > 0 ? curIdx - 1 : Math.max(0, list.length - 1);
     const prev = list[prevIdx];
@@ -356,7 +517,7 @@ export default function App() {
         syncSettingsToServer({ activeVideoId: prev.id });
       }
     }
-  }, [queue, isOnline, activeItemId, syncSettingsToServer]);
+  }, [playingPlaylistItems, isOnline, activeItemId, syncSettingsToServer]);
 
   const seekIntervalRef = useRef(seekInterval);
   seekIntervalRef.current = seekInterval;
@@ -415,7 +576,7 @@ export default function App() {
   useEffect(() => {
     const onKeyDown = (e) => {
       const tag = e.target?.tagName?.toLowerCase();
-      if (tag === 'input' || tag === 'textarea') return;
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
 
       if (e.code === 'Space' || e.key === 'k' || e.key === 'K') {
         e.preventDefault();
@@ -432,7 +593,80 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [handleSeekRelative]);
 
-  // Import one or more local media files (from picker or drag-and-drop) into IndexedDB
+  // --- Named Playlist Curation ---
+  const handleSelectPlaylist = useCallback((playlistId) => {
+    setActivePlaylistId(playlistId);
+  }, []);
+
+  const handleCreatePlaylist = useCallback(
+    (name) => {
+      const id = `pl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const newPlaylist = {
+        id,
+        name: name.trim() || 'Untitled Playlist',
+        createdAt: Date.now(),
+        items: [],
+      };
+      setPlaylists((prev) => [...prev, newPlaylist]);
+      setActivePlaylistId(id);
+      showNotice(`Created playlist "${newPlaylist.name}"`, 'success');
+    },
+    [showNotice]
+  );
+
+  const handleRenamePlaylist = useCallback(
+    (playlistId, nextName) => {
+      const clean = nextName.trim();
+      if (!clean) return;
+      setPlaylists((prev) =>
+        prev.map((pl) => (pl.id === playlistId ? { ...pl, name: clean } : pl))
+      );
+      showNotice(`Renamed playlist to "${clean}"`, 'info');
+    },
+    [showNotice]
+  );
+
+  const handleDeletePlaylist = useCallback(
+    (playlistId) => {
+      setPlaylists((prev) => {
+        if (prev.length <= 1) return prev;
+        const remaining = prev.filter((pl) => pl.id !== playlistId);
+        if (activePlaylistId === playlistId && remaining[0]) {
+          setActivePlaylistId(remaining[0].id);
+        }
+        return remaining;
+      });
+      showNotice('Deleted playlist', 'info');
+    },
+    [activePlaylistId, showNotice]
+  );
+
+  // Touch & Pointer Drag-and-Drop / Move Up-Down reordering (never disturbs active playback!)
+  const handleMoveQueueItem = useCallback(
+    (fromIdx, toIdx) => {
+      setPlaylists((prev) =>
+        prev.map((pl) => {
+          if (pl.id !== activePlaylist.id) return pl;
+          if (
+            fromIdx < 0 ||
+            toIdx < 0 ||
+            fromIdx >= pl.items.length ||
+            toIdx >= pl.items.length
+          ) {
+            return pl;
+          }
+          const reordered = arrayMove(pl.items, fromIdx, toIdx).map((item, idx) => ({
+            ...item,
+            queueOrder: idx,
+          }));
+          return { ...pl, items: reordered };
+        })
+      );
+    },
+    [activePlaylist.id]
+  );
+
+  // --- Sequential Multi-File Local Media Import (Mobile RAM safe) ---
   const handleImportLocalFiles = useCallback(
     async (fileList, playFirst = true) => {
       const files = Array.from(fileList || []).filter(
@@ -447,13 +681,19 @@ export default function App() {
         return;
       }
 
-      setIsImportingLocal(true);
-      try {
-        const importedItems = [];
-        const baseOrder = queue.length;
+      const targetPlaylistId = activePlaylist.id;
+      let firstImportedId = null;
+      let importedCount = 0;
 
+      try {
         for (let idx = 0; idx < files.length; idx++) {
           const file = files[idx];
+          setLocalImportProgress({
+            current: idx + 1,
+            total: files.length,
+            fileName: file.name,
+          });
+
           const info = await extractMediaInfo(file, 5);
           const id = `local:${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 7)}`;
 
@@ -467,41 +707,53 @@ export default function App() {
             duration: info.duration,
           });
 
-          importedItems.push(
-            createLocalQueueItem({
-              id,
-              fileName: file.name,
-              mimeType: file.type || (info.isAudio ? 'audio/mpeg' : 'video/mp4'),
-              sizeBytes: file.size,
-              thumbnailDataUrl: info.thumbnailDataUrl,
-              duration: info.duration,
-              queueOrder: baseOrder + idx,
-            })
+          const newItem = createLocalQueueItem({
+            id,
+            fileName: file.name,
+            mimeType: file.type || (info.isAudio ? 'audio/mpeg' : 'video/mp4'),
+            sizeBytes: file.size,
+            thumbnailDataUrl: info.thumbnailDataUrl,
+            duration: info.duration,
+            queueOrder: idx,
+          });
+
+          if (!firstImportedId) firstImportedId = newItem.id;
+          importedCount += 1;
+
+          // Append each completed file immediately into the active playlist & history
+          setPlaylists((prev) =>
+            prev.map((pl) =>
+              pl.id === targetPlaylistId
+                ? {
+                    ...pl,
+                    items: [...pl.items, { ...newItem, queueOrder: pl.items.length }],
+                  }
+                : pl
+            )
           );
+          upsertHistoryItems([newItem]);
         }
 
-        setItems((prev) => [...prev, ...importedItems]);
-
-        if (playFirst && importedItems[0]) {
-          setActiveItemId(importedItems[0].id);
+        if (playFirst && firstImportedId) {
+          setActiveItemId(firstImportedId);
         }
 
         showNotice(
-          importedItems.length === 1
-            ? `Saved "${importedItems[0].title}" for offline playback`
-            : `Imported ${importedItems.length} offline lectures into Study Queue`,
+          importedCount === 1
+            ? `Saved 1 local lecture to "${activePlaylist.name}" (Offline Ready)`
+            : `Imported ${importedCount} offline lectures into "${activePlaylist.name}"`,
           'success'
         );
       } catch (err) {
         showNotice(err?.message || 'Failed to save local media to IndexedDB.', 'error');
       } finally {
-        setIsImportingLocal(false);
+        setLocalImportProgress(null);
       }
     },
-    [queue.length, showNotice]
+    [activePlaylist.id, activePlaylist.name, showNotice, upsertHistoryItems]
   );
 
-  // Desktop drag-and-drop listeners
+  // Desktop multi-file drag-and-drop listeners
   useEffect(() => {
     const onDragEnter = (e) => {
       if (!e.dataTransfer?.types?.includes('Files')) return;
@@ -540,16 +792,15 @@ export default function App() {
     };
   }, [handleImportLocalFiles, activeItemId]);
 
-  // Upgrade an existing queue/history item (e.g. Error 101/150 restricted video) to a local IndexedDB copy
+  // Upgrade an existing item (e.g. Error 101/150 restricted video) to a local IndexedDB copy
   const handleReplaceWithLocalFile = useCallback(
     async (targetItem, file) => {
       if (!targetItem || !file) return;
-      setIsImportingLocal(true);
+      setLocalImportProgress({ current: 1, total: 1, fileName: file.name });
       try {
         const info = await extractMediaInfo(file, 5);
         const blobId = `local-upgrade:${targetItem.id}:${Date.now()}`;
 
-        // Delete any previously attached blob on this item
         if (targetItem.localBlobId) {
           await deleteMediaFile(targetItem.localBlobId).catch(() => {});
         }
@@ -560,41 +811,42 @@ export default function App() {
           mimeType: file.type || (info.isAudio ? 'audio/mpeg' : 'video/mp4'),
           sizeBytes: file.size,
           blob: file,
-          thumbnailDataUrl: info.thumbnailDataUrl || targetItem.thumbnail || null,
-          duration: info.duration || targetItem.duration || 0,
+          thumbnailDataUrl: targetItem.thumbnail || info.thumbnailDataUrl || null,
+          duration: info.duration > 0 ? info.duration : targetItem.duration || 0,
         });
 
-        setItems((prev) =>
-          prev.map((i) =>
-            i.id === targetItem.id
-              ? {
-                  ...i,
-                  sourceType: 'local',
-                  localBlobId: blobId,
-                  isOfflineReady: true,
-                  mimeType: file.type || (info.isAudio ? 'audio/mpeg' : 'video/mp4'),
-                  sizeBytes: file.size,
-                  thumbnail: i.thumbnail || info.thumbnailDataUrl || null,
-                  duration: info.duration > 0 ? info.duration : i.duration,
-                  inQueue: true,
-                  lastWatchedAt: new Date().toISOString(),
-                }
-              : i
-          )
-        );
+        updateItemAcrossAll(targetItem.id, (i) => ({
+          ...i,
+          sourceType: 'local',
+          localBlobId: blobId,
+          isOfflineReady: true,
+          mimeType: file.type || (info.isAudio ? 'audio/mpeg' : 'video/mp4'),
+          sizeBytes: file.size,
+          thumbnail: i.thumbnail || info.thumbnailDataUrl || null,
+          duration: info.duration > 0 ? info.duration : i.duration,
+          downloadError: null,
+          lastWatchedAt: new Date().toISOString(),
+        }));
+
+        setBatchErrors((prev) => {
+          if (!prev[targetItem.id]) return prev;
+          const next = { ...prev };
+          delete next[targetItem.id];
+          return next;
+        });
 
         setActiveItemId(targetItem.id);
         showNotice(`Upgraded "${targetItem.title}" to Offline Ready local playback!`, 'success');
       } catch (err) {
         showNotice(err?.message || 'Could not import local replacement file.', 'error');
       } finally {
-        setIsImportingLocal(false);
+        setLocalImportProgress(null);
       }
     },
-    [showNotice]
+    [showNotice, updateItemAcrossAll]
   );
 
-  // Pull a YouTube lecture via the user's private Home Sidecar straight into IndexedDB
+  // Pull a single YouTube lecture via the user's private Home Sidecar straight into IndexedDB
   const handleFetchViaSidecar = useCallback(
     async (targetItem, format = 'mp4') => {
       const url = getExternalUrl(targetItem);
@@ -627,6 +879,87 @@ export default function App() {
     [sidecarConfigured, sidecarUrl, sidecarApiKey, handleReplaceWithLocalFile, showNotice]
   );
 
+  // --- Sequential Offline Playlist Downloader ---
+  const handleStartPlaylistDownload = useCallback(
+    async (playlist, format = 'mp4') => {
+      if (!playlist) return;
+      const downloader = playlistDownloaderRef.current;
+      if (downloader.isRunning()) {
+        showNotice('A playlist download is already in progress.', 'info');
+        return;
+      }
+
+      const result = await downloader.start({
+        playlistId: playlist.id,
+        items: playlist.items,
+        format,
+        sidecarUrl,
+        sidecarApiKey,
+        onPreflightFailed: (message) => {
+          showNotice(message, 'error');
+        },
+        onStateUpdate: (state) => {
+          setBatchDownload(state);
+        },
+        onItemComplete: (item, upgradePatch) => {
+          updateItemAcrossAll(item.id, (existing) => ({
+            ...existing,
+            ...upgradePatch,
+          }));
+          setBatchErrors((prev) => {
+            if (!prev[item.id]) return prev;
+            const next = { ...prev };
+            delete next[item.id];
+            return next;
+          });
+        },
+        onItemError: (item, errorMessage) => {
+          setBatchErrors((prev) => ({ ...prev, [item.id]: errorMessage }));
+        },
+      });
+
+      if (!result?.started) return;
+
+      if (result.cancelled) {
+        showNotice(
+          result.completed > 0
+            ? `Download cancelled — ${result.completed} completed lecture${
+                result.completed === 1 ? '' : 's'
+              } saved offline.`
+            : 'Playlist download cancelled.',
+          'info'
+        );
+      } else if (result.failed > 0) {
+        showNotice(
+          `Saved ${result.completed} of ${result.total} lectures offline (${result.failed} failed).`,
+          'info'
+        );
+      } else if (result.completed > 0) {
+        showNotice(
+          `Downloaded all ${result.completed} lectures in "${playlist.name}" for offline playback!`,
+          'success'
+        );
+      }
+    },
+    [sidecarUrl, sidecarApiKey, showNotice, updateItemAcrossAll]
+  );
+
+  const handleTogglePausePlaylistDownload = useCallback(() => {
+    const downloader = playlistDownloaderRef.current;
+    if (!downloader.isRunning()) return;
+    if (downloader.isPaused()) {
+      downloader.resume();
+      setBatchDownload((prev) => (prev ? { ...prev, status: 'downloading' } : null));
+    } else {
+      downloader.pause();
+      setBatchDownload((prev) => (prev ? { ...prev, status: 'paused' } : null));
+    }
+  }, []);
+
+  const handleCancelPlaylistDownload = useCallback(() => {
+    playlistDownloaderRef.current.cancel();
+  }, []);
+
   // Add or Play any URL (YouTube video, YouTube playlist, Vimeo, or Direct MP4/MP3)
   const handleAddUrl = async (playImmediately = true) => {
     setUrlError('');
@@ -642,14 +975,14 @@ export default function App() {
     const rawUrl = urlInput.trim();
     setUrlInput('');
 
-    // Handle YouTube Playlist expansion automatically
+    // Handle YouTube Playlist expansion -> create named playlist OR append to current playlist
     if (detected.sourceType === 'youtube' && detected.isPlaylist && detected.playlistId) {
       setIsAddingUrl(true);
       try {
         const playlistData = await fetchYouTubePlaylist(detected.playlistId);
         if (playlistData && Array.isArray(playlistData.items) && playlistData.items.length > 0) {
-          const baseOrder = queue.length;
           const nowIso = new Date().toISOString();
+          const ytPlaylistName = playlistData.playlistTitle || 'YouTube Playlist';
 
           const playlistItems = playlistData.items.map((entry, idx) =>
             normalizeQueueItem({
@@ -659,7 +992,7 @@ export default function App() {
               sourceUrl: entry.sourceUrl,
               localBlobId: null,
               playlistId: detected.playlistId,
-              playlistTitle: playlistData.playlistTitle || 'YouTube Playlist',
+              playlistTitle: ytPlaylistName,
               title: entry.title,
               author: entry.author || '',
               thumbnail: entry.thumbnail,
@@ -667,51 +1000,57 @@ export default function App() {
               lastPosition: 0,
               isOfflineReady: false,
               inQueue: true,
-              queueOrder: baseOrder + idx,
+              queueOrder: idx,
               lastWatchedAt: nowIso,
             })
           );
 
-          setItems((prev) => {
-            const existingMap = new Map(prev.map((i) => [i.id, i]));
-            const nextList = [...prev];
-            for (const pItem of playlistItems) {
-              const existing = existingMap.get(pItem.id);
-              if (existing) {
-                const idxInList = nextList.findIndex((x) => x.id === pItem.id);
-                if (idxInList >= 0) {
-                  nextList[idxInList] = {
-                    ...existing,
-                    inQueue: true,
-                    playlistId: pItem.playlistId,
-                    playlistTitle: pItem.playlistTitle,
-                    title: existing.title?.startsWith('Loading') ? pItem.title : existing.title,
-                    duration: existing.duration || pItem.duration,
-                  };
-                }
-              } else {
-                nextList.push(pItem);
-              }
-            }
-            return nextList;
-          });
+          if (playlistImportMode === 'new') {
+            const newPlId = `pl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+            const newNamedPlaylist = {
+              id: newPlId,
+              name: ytPlaylistName,
+              createdAt: Date.now(),
+              items: playlistItems,
+            };
+            setPlaylists((prev) => [...prev, newNamedPlaylist]);
+            setActivePlaylistId(newPlId);
+          } else {
+            // Append into currently active playlist (deduplicating by id)
+            const targetId = activePlaylist.id;
+            setPlaylists((prev) =>
+              prev.map((pl) => {
+                if (pl.id !== targetId) return pl;
+                const existingIds = new Set(pl.items.map((i) => i.id));
+                const additions = playlistItems.filter((i) => !existingIds.has(i.id));
+                const merged = [...pl.items, ...additions].map((item, i) => ({
+                  ...item,
+                  queueOrder: i,
+                }));
+                return { ...pl, items: merged };
+              })
+            );
+          }
 
-          const targetId =
+          upsertHistoryItems(playlistItems);
+
+          const startVideoId =
             detected.youtubeVideoId &&
             playlistItems.some((item) => item.id === detected.youtubeVideoId)
               ? detected.youtubeVideoId
               : playlistItems[0].id;
 
-          if (playImmediately && targetId) {
-            setActiveItemId(targetId);
-            syncSettingsToServer({ activeVideoId: targetId });
+          if (playImmediately && startVideoId) {
+            setActiveItemId(startVideoId);
+            syncSettingsToServer({ activeVideoId: startVideoId });
           }
 
-          // Background sync playlist items (batched cleanly)
           playlistItems.slice(0, 30).forEach((item) => syncItemToServer(item));
 
           showNotice(
-            `Added ${playlistItems.length} lectures from "${playlistData.playlistTitle || 'Playlist'}"`,
+            playlistImportMode === 'new'
+              ? `Created playlist "${ytPlaylistName}" (${playlistItems.length} lectures)`
+              : `Appended ${playlistItems.length} lectures to "${activePlaylist.name}"`,
             'success'
           );
           return;
@@ -729,17 +1068,28 @@ export default function App() {
       lastWatchedAt: new Date().toISOString(),
     });
 
-    setItems((prev) => {
-      const existing = prev.find((i) => i.id === newItem.id);
-      if (existing) {
-        return prev.map((i) =>
-          i.id === newItem.id
-            ? { ...i, inQueue: true, playlistId: newItem.playlistId || i.playlistId }
-            : i
-        );
-      }
-      return [...prev, newItem];
-    });
+    const targetPlaylistId = activePlaylist.id;
+    setPlaylists((prev) =>
+      prev.map((pl) => {
+        if (pl.id !== targetPlaylistId) return pl;
+        const exists = pl.items.some((i) => i.id === newItem.id);
+        if (exists) {
+          return {
+            ...pl,
+            items: pl.items.map((i) =>
+              i.id === newItem.id
+                ? { ...i, playlistId: newItem.playlistId || i.playlistId }
+                : i
+            ),
+          };
+        }
+        return {
+          ...pl,
+          items: [...pl.items, { ...newItem, queueOrder: pl.items.length }],
+        };
+      })
+    );
+    upsertHistoryItems([newItem]);
 
     if (playImmediately) {
       setActiveItemId(newItem.id);
@@ -748,7 +1098,10 @@ export default function App() {
 
     // Fetch real title, author & thumbnail for YouTube & Vimeo in background
     if (newItem.sourceType === 'youtube' || newItem.sourceType === 'vimeo') {
-      const meta = await fetchSourceMetadata({ ...detected, sourceUrl: newItem.sourceUrl || rawUrl });
+      const meta = await fetchSourceMetadata({
+        ...detected,
+        sourceUrl: newItem.sourceUrl || rawUrl,
+      });
       const resolvedTitle =
         meta?.title ||
         (newItem.sourceType === 'vimeo'
@@ -767,19 +1120,13 @@ export default function App() {
         duration: resolvedDuration,
       };
 
-      setItems((prev) =>
-        prev.map((i) =>
-          i.id === newItem.id
-            ? {
-                ...i,
-                title: resolvedTitle,
-                author: meta?.author || i.author || '',
-                thumbnail: resolvedThumb || i.thumbnail,
-                duration: resolvedDuration > 0 ? resolvedDuration : i.duration,
-              }
-            : i
-        )
-      );
+      updateItemAcrossAll(newItem.id, (i) => ({
+        ...i,
+        title: resolvedTitle,
+        author: meta?.author || i.author || '',
+        thumbnail: resolvedThumb || i.thumbnail,
+        duration: resolvedDuration > 0 ? resolvedDuration : i.duration,
+      }));
 
       syncItemToServer(updatedItem);
     } else {
@@ -792,20 +1139,19 @@ export default function App() {
       if (!activeItemId) return;
       const nowIso = new Date().toISOString();
 
-      setItems((prev) =>
-        prev.map((i) =>
-          i.id === activeItemId
-            ? {
-                ...i,
-                lastPosition: time,
-                duration: dur > 0 ? dur : i.duration,
-                lastWatchedAt: nowIso,
-              }
-            : i
-        )
-      );
+      updateItemAcrossAll(activeItemId, (i) => ({
+        ...i,
+        lastPosition: time,
+        duration: dur > 0 ? dur : i.duration,
+        lastWatchedAt: nowIso,
+      }));
 
-      if (isOnline && activeItem && activeItem.sourceType !== 'local' && !activeItemId.startsWith('local:')) {
+      if (
+        isOnline &&
+        activeItem &&
+        activeItem.sourceType !== 'local' &&
+        !activeItemId.startsWith('local:')
+      ) {
         fetch('/api/progress', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -820,7 +1166,7 @@ export default function App() {
         }).catch(() => {});
       }
     },
-    [activeItemId, activeItem, workspaceId, isOnline]
+    [activeItemId, activeItem, workspaceId, isOnline, updateItemAcrossAll]
   );
 
   const handleSelectVideo = (item) => {
@@ -832,7 +1178,18 @@ export default function App() {
   };
 
   const handleRemoveFromQueue = (itemId) => {
-    setItems((prev) => prev.map((i) => (i.id === itemId ? { ...i, inQueue: false } : i)));
+    setPlaylists((prev) =>
+      prev.map((pl) =>
+        pl.id === activePlaylist.id
+          ? {
+              ...pl,
+              items: pl.items
+                .filter((i) => i.id !== itemId)
+                .map((item, idx) => ({ ...item, queueOrder: idx })),
+            }
+          : pl
+      )
+    );
     if (isOnline && !itemId.startsWith('local:')) {
       fetch(`/api/items/${encodeURIComponent(itemId)}?workspaceId=${encodeURIComponent(workspaceId)}`, {
         method: 'DELETE',
@@ -841,11 +1198,17 @@ export default function App() {
   };
 
   const handleDeleteHistoryItem = async (itemId) => {
-    const target = items.find((i) => i.id === itemId);
+    const target = historyItems.find((i) => i.id === itemId);
     if (target?.localBlobId) {
       await deleteMediaFile(target.localBlobId).catch(() => {});
     }
-    setItems((prev) => prev.filter((i) => i.id !== itemId));
+    setHistoryItems((prev) => prev.filter((i) => i.id !== itemId));
+    setPlaylists((prev) =>
+      prev.map((pl) => ({
+        ...pl,
+        items: pl.items.filter((i) => i.id !== itemId),
+      }))
+    );
     if (activeItemId === itemId) setActiveItemId(null);
 
     if (isOnline && !itemId.startsWith('local:')) {
@@ -864,25 +1227,23 @@ export default function App() {
     }
 
     if (item.sourceUrl) {
-      // Revert upgraded online lecture back to its original online source
       const detected = detectSourceFromUrl(item.sourceUrl);
-      setItems((prev) =>
-        prev.map((i) =>
-          i.id === item.id
-            ? {
-                ...i,
-                sourceType: detected?.sourceType || 'youtube',
-                localBlobId: null,
-                isOfflineReady: false,
-                sizeBytes: null,
-              }
-            : i
-        )
-      );
+      updateItemAcrossAll(item.id, (i) => ({
+        ...i,
+        sourceType: detected?.sourceType || 'youtube',
+        localBlobId: null,
+        isOfflineReady: false,
+        sizeBytes: null,
+      }));
       showNotice(`Deleted offline copy of "${item.title}" to free storage.`, 'info');
     } else {
-      // Pure local import — remove item cleanly
-      setItems((prev) => prev.filter((i) => i.id !== item.id));
+      setPlaylists((prev) =>
+        prev.map((pl) => ({
+          ...pl,
+          items: pl.items.filter((i) => i.id !== item.id),
+        }))
+      );
+      setHistoryItems((prev) => prev.filter((i) => i.id !== item.id));
       if (activeItemId === item.id) setActiveItemId(null);
       showNotice(`Deleted local file "${item.title}" from device storage.`, 'info');
     }
@@ -891,8 +1252,8 @@ export default function App() {
   // Wipe all IndexedDB blobs from Settings Modal
   const handleClearOfflineMedia = async () => {
     await clearAllMediaFiles();
-    setItems((prev) =>
-      prev
+    const stripOffline = (list) =>
+      list
         .map((i) => {
           if (!i.isOfflineReady && i.sourceType !== 'local') return i;
           if (i.sourceUrl) {
@@ -907,32 +1268,21 @@ export default function App() {
           }
           return null;
         })
-        .filter(Boolean)
-    );
+        .filter(Boolean);
+
+    setPlaylists((prev) => prev.map((pl) => ({ ...pl, items: stripOffline(pl.items) })));
+    setHistoryItems((prev) => stripOffline(prev));
     showNotice('Cleared all offline media blobs from IndexedDB.', 'info');
-  };
-
-  const handleMoveQueueItem = (fromIdx, toIdx) => {
-    const updatedQueue = [...queue];
-    const [moved] = updatedQueue.splice(fromIdx, 1);
-    updatedQueue.splice(toIdx, 0, moved);
-    const orderMap = new Map(updatedQueue.map((item, index) => [item.id, index]));
-
-    setItems((prev) =>
-      prev.map((item) =>
-        orderMap.has(item.id) ? { ...item, queueOrder: orderMap.get(item.id) } : item
-      )
-    );
   };
 
   const handlePlayerStateChange = useCallback(
     (playing, canonicalState) => {
       setIsPlaying(playing);
-      if (canonicalState === 'ended' && queue.length > 1) {
+      if (canonicalState === 'ended' && playingPlaylistItems.length > 1) {
         handleNextTrack();
       }
     },
-    [queue.length, handleNextTrack]
+    [playingPlaylistItems.length, handleNextTrack]
   );
 
   const handleCycleInterval = () => {
@@ -987,9 +1337,39 @@ export default function App() {
 
   const progressPct = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
 
+  const sharedQueueProps = {
+    playlists,
+    activePlaylistId: activePlaylist.id,
+    queue,
+    history,
+    activeItemId,
+    isOnline,
+    sidecarConfigured,
+    fallbackConverterUrl,
+    extractingItemId,
+    localImportProgress,
+    batchDownload,
+    batchErrors,
+    onSelectPlaylist: handleSelectPlaylist,
+    onCreatePlaylist: handleCreatePlaylist,
+    onRenamePlaylist: handleRenamePlaylist,
+    onDeletePlaylist: handleDeletePlaylist,
+    onSelectVideo: handleSelectVideo,
+    onRemoveFromQueue: handleRemoveFromQueue,
+    onDeleteHistoryItem: handleDeleteHistoryItem,
+    onDeleteLocalFile: handleDeleteLocalFile,
+    onMoveQueueItem: handleMoveQueueItem,
+    onReplaceWithLocalFile: handleReplaceWithLocalFile,
+    onFetchViaSidecar: handleFetchViaSidecar,
+    onStartPlaylistDownload: handleStartPlaylistDownload,
+    onTogglePausePlaylistDownload: handleTogglePausePlaylistDownload,
+    onCancelPlaylistDownload: handleCancelPlaylistDownload,
+    onNotify: showNotice,
+  };
+
   return (
     <div className="min-h-screen bg-obsidian-950 text-zinc-100">
-      {/* Hidden local media file picker */}
+      {/* Hidden multi-file local media picker */}
       <input
         ref={localFileInputRef}
         type="file"
@@ -997,23 +1377,25 @@ export default function App() {
         multiple
         onChange={(e) => {
           if (e.target.files?.length) {
-            handleImportLocalFiles(e.target.files, true);
+            handleImportLocalFiles(e.target.files, !activeItemId);
           }
           e.target.value = '';
         }}
         className="hidden"
       />
 
-      {/* Full-window Desktop Drag & Drop Overlay */}
+      {/* Full-window Desktop Multi-File Drag & Drop Overlay */}
       {isDraggingFiles && (
         <div className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-obsidian-950/85 p-6 backdrop-blur-md">
           <div className="flex max-w-md flex-col items-center rounded-3xl border-2 border-dashed border-amber-400 bg-obsidian-900/90 p-10 text-center shadow-2xl">
             <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-amber-500/20 text-amber-400">
               <Upload className="h-8 w-8" />
             </div>
-            <h2 className="text-lg font-bold text-white">Drop Local Lectures to Import</h2>
+            <h2 className="text-lg font-bold text-white">
+              Drop Local Lectures into &ldquo;{activePlaylist.name}&rdquo;
+            </h2>
             <p className="mt-1.5 text-xs text-zinc-400">
-              MP4, WebM, MP3, and M4A files are stored offline in IndexedDB with auto-generated thumbnails.
+              Drop one or multiple MP4, WebM, MP3, or M4A files — processed sequentially into IndexedDB with auto-generated thumbnails.
             </p>
           </div>
         </div>
@@ -1040,7 +1422,7 @@ export default function App() {
                   </span>
                 )}
               </div>
-              <p className="text-[11px] text-zinc-500">Unified Hands-Free & Offline Lecture Player</p>
+              <p className="text-[11px] text-zinc-500">Unified Hands-Free &amp; Offline Lecture Player</p>
             </div>
           </div>
 
@@ -1151,7 +1533,9 @@ export default function App() {
               aria-label="Refresh App"
               className="rounded-lg border border-zinc-800 bg-obsidian-900 p-2 text-zinc-300 transition hover:border-amber-500/50 hover:text-amber-400 disabled:opacity-60"
             >
-              <RefreshCw className={`h-4 w-4 ${isRefreshingApp ? 'animate-spin text-amber-400' : ''}`} />
+              <RefreshCw
+                className={`h-4 w-4 ${isRefreshingApp ? 'animate-spin text-amber-400' : ''}`}
+              />
             </button>
 
             {/* Settings */}
@@ -1169,7 +1553,7 @@ export default function App() {
 
       {/* Main Content */}
       <main className="mx-auto max-w-7xl px-4 py-5">
-        {/* Universal Source URL Bar + Import Local Media */}
+        {/* Universal Source URL Bar + Multi-File Import Local Media */}
         <div className="mb-5">
           <form
             onSubmit={(e) => {
@@ -1217,7 +1601,7 @@ export default function App() {
                 type="button"
                 disabled={isImportingLocal}
                 onClick={() => localFileInputRef.current?.click()}
-                title="Import local MP4, WebM, MP3, or M4A files for offline study"
+                title="Import one or multiple local MP4, WebM, MP3, or M4A files for offline study"
                 className="flex items-center justify-center gap-1.5 rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-4 py-3 text-sm font-semibold text-emerald-300 transition hover:border-emerald-500/60 hover:bg-emerald-500/20 disabled:opacity-60"
               >
                 {isImportingLocal ? (
@@ -1225,10 +1609,49 @@ export default function App() {
                 ) : (
                   <Upload className="h-4 w-4" />
                 )}
-                <span>Import Local Media</span>
+                <span>
+                  {localImportProgress
+                    ? `Importing ${localImportProgress.current}/${localImportProgress.total}...`
+                    : 'Import Local Media'}
+                </span>
               </button>
             </div>
           </form>
+
+          {/* Playlist Import Mode Toggle (shown automatically when a YouTube playlist URL is pasted) */}
+          {urlLooksLikePlaylist && (
+            <div className="mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-xs">
+              <span className="flex items-center gap-1.5 font-semibold text-amber-300">
+                <ListPlus className="h-3.5 w-3.5" />
+                Playlist link detected:
+              </span>
+              <div className="flex items-center gap-1 rounded-lg bg-obsidian-950 p-0.5">
+                <button
+                  type="button"
+                  onClick={() => setPlaylistImportMode('new')}
+                  className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition ${
+                    playlistImportMode === 'new'
+                      ? 'bg-amber-500 text-black'
+                      : 'text-zinc-400 hover:text-white'
+                  }`}
+                >
+                  Create New Named Playlist
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPlaylistImportMode('append')}
+                  className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition ${
+                    playlistImportMode === 'append'
+                      ? 'bg-amber-500 text-black'
+                      : 'text-zinc-400 hover:text-white'
+                  }`}
+                >
+                  Append to &ldquo;{activePlaylist.name}&rdquo;
+                </button>
+              </div>
+            </div>
+          )}
+
           {urlError && <p className="mt-1.5 text-xs text-red-400">{urlError}</p>}
         </div>
 
@@ -1351,7 +1774,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={handlePrevTrack}
-                      disabled={queue.length < 2}
+                      disabled={playingPlaylistItems.length < 2}
                       title="Previous Lecture"
                       className="rounded-full p-2 text-zinc-400 transition hover:bg-obsidian-800 hover:text-white disabled:opacity-30"
                     >
@@ -1393,7 +1816,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={handleNextTrack}
-                      disabled={queue.length < 2}
+                      disabled={playingPlaylistItems.length < 2}
                       title="Next Lecture"
                       className="rounded-full p-2 text-zinc-400 transition hover:bg-obsidian-800 hover:text-white disabled:opacity-30"
                     >
@@ -1402,7 +1825,6 @@ export default function App() {
                   </div>
 
                   <div className="flex items-center gap-2">
-                    {/* Interval Pill (Amber) */}
                     <button
                       type="button"
                       onClick={handleCycleInterval}
@@ -1412,7 +1834,6 @@ export default function App() {
                       {seekInterval}s
                     </button>
 
-                    {/* Playback Speed Pill */}
                     <button
                       type="button"
                       onClick={handleCycleSpeed}
@@ -1422,7 +1843,6 @@ export default function App() {
                       {playbackSpeed}x
                     </button>
 
-                    {/* Audio-Only Mode Pill */}
                     <button
                       type="button"
                       onClick={() => setAudioOnlyMode((prev) => !prev)}
@@ -1441,25 +1861,9 @@ export default function App() {
               </div>
             </div>
 
-            {/* Right Sidebar: Queue & History */}
+            {/* Right Sidebar: Named Playlists & History */}
             <div className="lg:col-span-4 xl:col-span-3">
-              <QueuePanel
-                queue={queue}
-                history={history}
-                activeItemId={activeItemId}
-                isOnline={isOnline}
-                sidecarConfigured={sidecarConfigured}
-                fallbackConverterUrl={fallbackConverterUrl}
-                extractingItemId={extractingItemId}
-                onSelectVideo={handleSelectVideo}
-                onRemoveFromQueue={handleRemoveFromQueue}
-                onDeleteHistoryItem={handleDeleteHistoryItem}
-                onDeleteLocalFile={handleDeleteLocalFile}
-                onMoveQueueItem={handleMoveQueueItem}
-                onReplaceWithLocalFile={handleReplaceWithLocalFile}
-                onFetchViaSidecar={handleFetchViaSidecar}
-                onNotify={showNotice}
-              />
+              <QueuePanel {...sharedQueueProps} />
             </div>
           </div>
         )}
@@ -1475,8 +1879,8 @@ export default function App() {
                 duration={duration}
                 seekInterval={seekInterval}
                 playbackSpeed={playbackSpeed}
-                hasPrev={queue.length > 1}
-                hasNext={queue.length > 1}
+                hasPrev={playingPlaylistItems.length > 1}
+                hasNext={playingPlaylistItems.length > 1}
                 lastSignal={lastSignal}
                 onTogglePlay={handleTogglePlay}
                 onSeekRelative={handleSeekRelative}
@@ -1525,23 +1929,7 @@ export default function App() {
             </div>
 
             <div className="lg:col-span-4">
-              <QueuePanel
-                queue={queue}
-                history={history}
-                activeItemId={activeItemId}
-                isOnline={isOnline}
-                sidecarConfigured={sidecarConfigured}
-                fallbackConverterUrl={fallbackConverterUrl}
-                extractingItemId={extractingItemId}
-                onSelectVideo={handleSelectVideo}
-                onRemoveFromQueue={handleRemoveFromQueue}
-                onDeleteHistoryItem={handleDeleteHistoryItem}
-                onDeleteLocalFile={handleDeleteLocalFile}
-                onMoveQueueItem={handleMoveQueueItem}
-                onReplaceWithLocalFile={handleReplaceWithLocalFile}
-                onFetchViaSidecar={handleFetchViaSidecar}
-                onNotify={showNotice}
-              />
+              <QueuePanel {...sharedQueueProps} />
             </div>
           </div>
         )}
@@ -1556,7 +1944,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Status Toast (Playlist imports, Offline saves, Sidecar progress) */}
+      {/* Status Toast */}
       {statusToast && (
         <div
           className={`fixed bottom-16 left-1/2 z-40 flex -translate-x-1/2 items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold shadow-2xl backdrop-blur-md ${
@@ -1620,7 +2008,7 @@ function EmptyPlayerCard({ onImportClick }) {
       </div>
       <h2 className="text-lg font-bold text-white">Paste a Lecture URL or Import Local Media</h2>
       <p className="mt-1.5 max-w-md text-xs leading-relaxed text-zinc-400">
-        Supports YouTube videos & playlists, Vimeo, direct MP4/MP3 links, and offline local files — with identical Car, Study, Theater & Bluetooth AVRCP controls.
+        Supports YouTube videos &amp; playlists, Vimeo, direct MP4/MP3 links, and multi-file offline local imports — with identical Car, Study, Theater &amp; Bluetooth AVRCP controls.
       </p>
       {onImportClick && (
         <button
@@ -1629,7 +2017,7 @@ function EmptyPlayerCard({ onImportClick }) {
           className="mt-4 inline-flex items-center gap-2 rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-4 py-2 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-500/20"
         >
           <Upload className="h-3.5 w-3.5" />
-          Import Local MP4 / MP3 (or Drag & Drop)
+          Import Local MP4 / MP3 Files (or Drag &amp; Drop)
         </button>
       )}
     </div>
