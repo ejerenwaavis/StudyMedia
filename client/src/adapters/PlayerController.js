@@ -2,6 +2,8 @@ import { YouTubeAdapter } from './YouTubeAdapter';
 import { HTML5Adapter } from './HTML5Adapter';
 import { VimeoAdapter } from './VimeoAdapter';
 
+const SEEK_ACCUMULATION_WINDOW_MS = 1500;
+
 /**
  * Unified PlayerController
  * Single canonical controller bridging the UI + Hardware MediaSession to whichever
@@ -21,6 +23,15 @@ export class PlayerController {
     this.currentSource = null;
     this.state = 'paused'; // 'playing' | 'paused' | 'buffering' | 'ended'
     this.lastSavedAt = 0;
+
+    // Optimistic seek accumulation state for rapid repeated hardware/UI taps
+    this.pendingSeekTarget = null;
+    this.lastSeekAt = 0;
+  }
+
+  _resetPendingSeek() {
+    this.pendingSeekTarget = null;
+    this.lastSeekAt = 0;
   }
 
   _createAdapter(sourceType, callbacks) {
@@ -44,6 +55,7 @@ export class PlayerController {
     this.currentSource = source;
     this.state = 'buffering';
     this.lastSavedAt = Date.now();
+    this._resetPendingSeek();
 
     const adapterCallbacks = {
       onReady: () => {
@@ -62,8 +74,26 @@ export class PlayerController {
         }
       },
       onTimeUpdate: (cur, dur) => {
-        this.callbacks.onTimeUpdate(cur, dur);
         const now = Date.now();
+
+        // While a recent seek is still buffering, prevent stale adapter ticks from snapping the UI backward
+        if (this.pendingSeekTarget !== null) {
+          const elapsed = now - this.lastSeekAt;
+          if (elapsed <= SEEK_ACCUMULATION_WINDOW_MS) {
+            if (Math.abs(cur - this.pendingSeekTarget) <= 1.5) {
+              // Adapter caught up to the seek target
+              this._resetPendingSeek();
+            } else {
+              // Keep UI scrubber pinned to the optimistic target while buffering
+              this.callbacks.onTimeUpdate(this.pendingSeekTarget, dur);
+              return;
+            }
+          } else {
+            this._resetPendingSeek();
+          }
+        }
+
+        this.callbacks.onTimeUpdate(cur, dur);
         if (this.state === 'playing' && now - this.lastSavedAt >= 5000) {
           this.lastSavedAt = now;
           this.callbacks.onProgressSave(cur, dur);
@@ -71,6 +101,7 @@ export class PlayerController {
       },
       onError: (err) => {
         this.state = 'paused';
+        this._resetPendingSeek();
         this.callbacks.onError(err);
       },
     };
@@ -96,16 +127,47 @@ export class PlayerController {
   }
 
   seekTo(seconds) {
-    this.adapter?.seekTo(seconds);
+    if (!this.adapter) return;
+    const dur = this.adapter.getDuration() || 0;
+    const clamped =
+      dur > 0 ? Math.max(0, Math.min(dur, seconds)) : Math.max(0, seconds);
+
+    this.pendingSeekTarget = clamped;
+    this.lastSeekAt = Date.now();
+
+    this.adapter.seekTo(clamped);
+    this.callbacks.onTimeUpdate(clamped, dur);
   }
 
-  seekRelative(delta) {
-    if (!this.adapter) return;
-    const cur = this.adapter.getCurrentTime();
-    const dur = this.adapter.getDuration();
-    const target = Math.max(0, dur > 0 ? Math.min(dur - 0.5, cur + delta) : cur + delta);
-    this.adapter.seekTo(target);
-    this.callbacks.onProgressSave(target, dur);
+  /**
+   * Relative seek with optimistic accumulation for repeated rapid taps.
+   * Always reads live time directly from the active adapter (never React state).
+   * If tapped again within 1500ms while buffering, accumulates on pendingSeekTarget
+   * so repeated taps step cleanly (-15s -> -30s -> -45s).
+   */
+  seekRelative(deltaSeconds) {
+    if (!this.adapter || !Number.isFinite(deltaSeconds)) return;
+
+    const now = Date.now();
+    const dur = this.adapter.getDuration() || 0;
+    const hasPendingSeek =
+      this.pendingSeekTarget !== null &&
+      now - this.lastSeekAt <= SEEK_ACCUMULATION_WINDOW_MS;
+
+    const baseTime = hasPendingSeek
+      ? this.pendingSeekTarget
+      : this.adapter.getCurrentTime() || 0;
+
+    const rawTarget = baseTime + deltaSeconds;
+    const newTarget =
+      dur > 0 ? Math.max(0, Math.min(dur, rawTarget)) : Math.max(0, rawTarget);
+
+    this.pendingSeekTarget = newTarget;
+    this.lastSeekAt = now;
+
+    this.adapter.seekTo(newTarget);
+    this.callbacks.onTimeUpdate(newTarget, dur);
+    this.callbacks.onProgressSave(newTarget, dur);
   }
 
   setPlaybackRate(rate) {
@@ -113,6 +175,12 @@ export class PlayerController {
   }
 
   getCurrentTime() {
+    if (
+      this.pendingSeekTarget !== null &&
+      Date.now() - this.lastSeekAt <= SEEK_ACCUMULATION_WINDOW_MS
+    ) {
+      return this.pendingSeekTarget;
+    }
     return this.adapter?.getCurrentTime() || 0;
   }
 
@@ -125,6 +193,7 @@ export class PlayerController {
   }
 
   destroyAdapter() {
+    this._resetPendingSeek();
     if (this.adapter) {
       this.adapter.destroy();
       this.adapter = null;

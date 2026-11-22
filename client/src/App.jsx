@@ -358,12 +358,27 @@ export default function App() {
     }
   }, [queue, isOnline, activeItemId, syncSettingsToServer]);
 
+  const seekIntervalRef = useRef(seekInterval);
+  seekIntervalRef.current = seekInterval;
+
   const handleSeekRelative = useCallback((delta) => {
     playerRef.current?.seekRelative(delta);
   }, []);
 
+  const handleSeekTo = useCallback((seconds) => {
+    playerRef.current?.seekTo(seconds);
+  }, []);
+
   const handleTogglePlay = useCallback(() => {
     playerRef.current?.togglePlay();
+  }, []);
+
+  const handlePlay = useCallback(() => {
+    playerRef.current?.play();
+  }, []);
+
+  const handlePause = useCallback(() => {
+    playerRef.current?.pause();
   }, []);
 
   // Unified Hardware MediaSession & Conditional Silent Audio Lock
@@ -379,11 +394,12 @@ export default function App() {
     doubleTapToSkip,
     doubleTapWindow,
     onSeekRelative: handleSeekRelative,
+    onSeekTo: handleSeekTo,
     onNextTrack: handleNextTrack,
     onPrevTrack: handlePrevTrack,
     onTogglePlay: handleTogglePlay,
-    onPlay: () => playerRef.current?.play(),
-    onPause: () => playerRef.current?.pause(),
+    onPlay: handlePlay,
+    onPause: handlePause,
   });
 
   // Show floating toast briefly whenever hardware signal arrives
@@ -395,7 +411,7 @@ export default function App() {
     return () => clearTimeout(toastTimerRef.current);
   }, [lastSignal]);
 
-  // Keyboard shortcuts for desktop usability
+  // Keyboard shortcuts for desktop usability (reads live seekIntervalRef)
   useEffect(() => {
     const onKeyDown = (e) => {
       const tag = e.target?.tagName?.toLowerCase();
@@ -406,15 +422,15 @@ export default function App() {
         playerRef.current?.togglePlay();
       } else if (e.code === 'ArrowLeft' || e.key === 'j' || e.key === 'J') {
         e.preventDefault();
-        handleSeekRelative(-seekInterval);
+        handleSeekRelative(-seekIntervalRef.current);
       } else if (e.code === 'ArrowRight' || e.key === 'l' || e.key === 'L') {
         e.preventDefault();
-        handleSeekRelative(seekInterval);
+        handleSeekRelative(seekIntervalRef.current);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleSeekRelative, seekInterval]);
+  }, [handleSeekRelative]);
 
   // Import one or more local media files (from picker or drag-and-drop) into IndexedDB
   const handleImportLocalFiles = useCallback(

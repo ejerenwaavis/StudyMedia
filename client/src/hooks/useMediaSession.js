@@ -40,21 +40,22 @@ function createSilentWavUrl() {
 
 /**
  * Unified Hardware MediaSession hook with Conditional Silent Audio Lock.
- * Binds exclusively to the canonical PlayerController actions (seekRelative,
- * togglePlay/play/pause, nextTrack, prevTrack) identically across all adapters.
+ * Stores seekInterval, doubleTapEnabled, doubleTapWindow, and all action callbacks
+ * in refs updated on every render so OS hardware handlers NEVER read stale state.
  */
 export function useMediaSession({
   sourceType = 'youtube',
   isPlaying,
   title,
   thumbnail,
-  seekInterval,
-  playbackSpeed,
+  seekInterval = 15,
+  playbackSpeed = 1,
   duration,
   currentTime,
   doubleTapToSkip = true,
   doubleTapWindow = 450,
   onSeekRelative,
+  onSeekTo,
   onNextTrack,
   onPrevTrack,
   onTogglePlay,
@@ -73,13 +74,18 @@ export function useMediaSession({
   const prevTapTimerRef = useRef(null);
   const nextTapTimerRef = useRef(null);
 
-  // Latest callbacks in refs so MediaSession handlers never go stale
+  // Dedicated live refs updated synchronously on every render (zero stale closures)
+  const seekIntervalRef = useRef(seekInterval);
+  const doubleTapEnabledRef = useRef(doubleTapToSkip);
+  const doubleTapWindowRef = useRef(doubleTapWindow);
   const callbacksRef = useRef({});
+
+  seekIntervalRef.current = Number(seekInterval) > 0 ? Number(seekInterval) : 15;
+  doubleTapEnabledRef.current = Boolean(doubleTapToSkip);
+  doubleTapWindowRef.current = Number(doubleTapWindow) > 0 ? Number(doubleTapWindow) : 450;
   callbacksRef.current = {
-    seekInterval,
-    doubleTapToSkip,
-    doubleTapWindow,
     onSeekRelative,
+    onSeekTo,
     onNextTrack,
     onPrevTrack,
     onTogglePlay,
@@ -197,22 +203,15 @@ export function useMediaSession({
     }
   }, [duration, currentTime, playbackSpeed]);
 
-  // Register MediaSession hardware action handlers (identical across all adapters)
+  // Register MediaSession hardware action handlers (always reading live refs!)
   useEffect(() => {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
 
     const handlePrevTrack = () => {
-      const {
-        seekInterval: interval,
-        doubleTapToSkip: canSkip,
-        doubleTapWindow: windowMs,
-        onSeekRelative: seek,
-        onPrevTrack: prevTrack,
-      } = callbacksRef.current;
-
-      if (!canSkip) {
-        emitSignal('previoustrack', `Rewind -${interval}s`);
-        seek?.(-interval);
+      if (!doubleTapEnabledRef.current) {
+        const liveInterval = seekIntervalRef.current;
+        emitSignal('previoustrack', `Rewind -${liveInterval}s`);
+        callbacksRef.current.onSeekRelative?.(-liveInterval);
         return;
       }
 
@@ -220,28 +219,23 @@ export function useMediaSession({
         clearTimeout(prevTapTimerRef.current);
         prevTapTimerRef.current = null;
         emitSignal('double-tap-prev', 'Previous Lecture in Queue');
-        prevTrack?.();
+        callbacksRef.current.onPrevTrack?.();
       } else {
+        const windowMs = doubleTapWindowRef.current;
         prevTapTimerRef.current = setTimeout(() => {
           prevTapTimerRef.current = null;
-          emitSignal('previoustrack', `Rewind -${interval}s`);
-          seek?.(-interval);
+          const liveInterval = seekIntervalRef.current;
+          emitSignal('previoustrack', `Rewind -${liveInterval}s`);
+          callbacksRef.current.onSeekRelative?.(-liveInterval);
         }, windowMs);
       }
     };
 
     const handleNextTrack = () => {
-      const {
-        seekInterval: interval,
-        doubleTapToSkip: canSkip,
-        doubleTapWindow: windowMs,
-        onSeekRelative: seek,
-        onNextTrack: nextTrack,
-      } = callbacksRef.current;
-
-      if (!canSkip) {
-        emitSignal('nexttrack', `Forward +${interval}s`);
-        seek?.(interval);
+      if (!doubleTapEnabledRef.current) {
+        const liveInterval = seekIntervalRef.current;
+        emitSignal('nexttrack', `Forward +${liveInterval}s`);
+        callbacksRef.current.onSeekRelative?.(liveInterval);
         return;
       }
 
@@ -249,26 +243,36 @@ export function useMediaSession({
         clearTimeout(nextTapTimerRef.current);
         nextTapTimerRef.current = null;
         emitSignal('double-tap-next', 'Next Lecture in Queue');
-        nextTrack?.();
+        callbacksRef.current.onNextTrack?.();
       } else {
+        const windowMs = doubleTapWindowRef.current;
         nextTapTimerRef.current = setTimeout(() => {
           nextTapTimerRef.current = null;
-          emitSignal('nexttrack', `Forward +${interval}s`);
-          seek?.(interval);
+          const liveInterval = seekIntervalRef.current;
+          emitSignal('nexttrack', `Forward +${liveInterval}s`);
+          callbacksRef.current.onSeekRelative?.(liveInterval);
         }, windowMs);
       }
     };
 
-    const handleSeekBackward = (details) => {
-      const interval = details?.seekOffset || callbacksRef.current.seekInterval;
-      emitSignal('seekbackward', `Rewind -${interval}s`);
-      callbacksRef.current.onSeekRelative?.(-interval);
+    // Always honor the user's live seekIntervalRef (never let OS/browser default 5s seekOffset override it)
+    const handleSeekBackward = () => {
+      const liveInterval = seekIntervalRef.current;
+      emitSignal('seekbackward', `Rewind -${liveInterval}s`);
+      callbacksRef.current.onSeekRelative?.(-liveInterval);
     };
 
-    const handleSeekForward = (details) => {
-      const interval = details?.seekOffset || callbacksRef.current.seekInterval;
-      emitSignal('seekforward', `Forward +${interval}s`);
-      callbacksRef.current.onSeekRelative?.(interval);
+    const handleSeekForward = () => {
+      const liveInterval = seekIntervalRef.current;
+      emitSignal('seekforward', `Forward +${liveInterval}s`);
+      callbacksRef.current.onSeekRelative?.(liveInterval);
+    };
+
+    const handleSeekTo = (details) => {
+      if (typeof details?.seekTime === 'number' && Number.isFinite(details.seekTime)) {
+        emitSignal('seekto', `Seek to ${Math.floor(details.seekTime)}s`);
+        callbacksRef.current.onSeekTo?.(details.seekTime);
+      }
     };
 
     const handlePlay = () => {
@@ -294,6 +298,7 @@ export function useMediaSession({
       ['nexttrack', handleNextTrack],
       ['seekbackward', handleSeekBackward],
       ['seekforward', handleSeekForward],
+      ['seekto', handleSeekTo],
       ['play', handlePlay],
       ['pause', handlePause],
     ];
@@ -319,15 +324,16 @@ export function useMediaSession({
 
   const triggerTestSignal = useCallback(
     (direction) => {
+      const liveInterval = seekIntervalRef.current;
       if (direction === 'prev') {
-        emitSignal('test-prev', `Simulated Back (-${seekInterval}s)`);
-        onSeekRelative?.(-seekInterval);
+        emitSignal('test-prev', `Simulated Back (-${liveInterval}s)`);
+        callbacksRef.current.onSeekRelative?.(-liveInterval);
       } else {
-        emitSignal('test-next', `Simulated Forward (+${seekInterval}s)`);
-        onSeekRelative?.(seekInterval);
+        emitSignal('test-next', `Simulated Forward (+${liveInterval}s)`);
+        callbacksRef.current.onSeekRelative?.(liveInterval);
       }
     },
-    [emitSignal, onSeekRelative, seekInterval]
+    [emitSignal]
   );
 
   // Derived lock mode for header indicator
