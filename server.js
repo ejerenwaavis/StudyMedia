@@ -3,18 +3,22 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const { connectDB } = require('./server/config/db');
+const authRoutes = require('./server/routes/authRoutes');
+const r2Routes = require('./server/routes/r2Routes');
 const studyRoutes = require('./server/routes/studyRoutes');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 
 // Connect to MongoDB Atlas (non-blocking fallback to localStorage if unavailable)
 connectDB();
 
 // API routes
+app.use('/api/auth', authRoutes);
+app.use('/api/r2', r2Routes);
 app.use('/api', studyRoutes);
 
 // Serve static frontend build from top-level public_html

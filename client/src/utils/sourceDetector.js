@@ -208,6 +208,7 @@ export function normalizeQueueItem(item) {
   let sourceType = item.sourceType;
   if (!sourceType) {
     if (item.localBlobId || id.startsWith('local:')) sourceType = 'local';
+    else if (item.r2Key) sourceType = 'r2';
     else if (id.startsWith('vimeo:')) sourceType = 'vimeo';
     else if (id.startsWith('direct:')) sourceType = 'direct';
     else sourceType = 'youtube';
@@ -227,7 +228,7 @@ export function normalizeQueueItem(item) {
     }
   }
 
-  const isOfflineReady = Boolean(item.isOfflineReady || (sourceType === 'local' && item.localBlobId));
+  const isOfflineReady = Boolean(item.isOfflineReady && item.localBlobId);
 
   return {
     ...item,
@@ -235,7 +236,8 @@ export function normalizeQueueItem(item) {
     videoId: id,
     sourceType,
     sourceUrl,
-    localBlobId: item.localBlobId || (sourceType === 'local' ? id : null),
+    r2Key: item.r2Key || null,
+    localBlobId: item.localBlobId || (sourceType === 'local' && item.isOfflineReady ? id : null),
     playlistId: item.playlistId || null,
     playlistTitle: item.playlistTitle || null,
     title: item.title || `Lecture (${id})`,

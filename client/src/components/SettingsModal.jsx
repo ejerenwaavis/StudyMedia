@@ -13,6 +13,8 @@ import {
   Eye,
   EyeOff,
   ExternalLink,
+  LogOut,
+  User,
 } from 'lucide-react';
 import { getStorageEstimate } from '../storage/mediaDB';
 import {
@@ -29,11 +31,14 @@ export default function SettingsModal({
   autoPlayNext = true,
   workspaceId,
   dbConnected,
+  r2Configured = false,
+  currentUser = null,
   sidecarUrl = '',
   sidecarApiKey = '',
   fallbackConverterUrl = DEFAULT_FALLBACK_CONVERTER_URL,
   onSave,
   onClearOfflineMedia,
+  onSignOut,
 }) {
   const [customInterval, setCustomInterval] = useState(String(seekInterval));
   const [dtEnabled, setDtEnabled] = useState(doubleTapToSkip);
@@ -144,6 +149,54 @@ export default function SettingsModal({
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">
+          {/* Account & Cloud Vault Status */}
+          {currentUser && (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-zinc-800 bg-obsidian-950 p-3.5">
+              <div className="flex min-w-0 items-center gap-2.5">
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/30">
+                  <User className="h-4 w-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5">
+                    <p className="truncate text-sm font-bold text-white">
+                      {currentUser.displayName}
+                    </p>
+                    <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-bold uppercase text-amber-300">
+                      {currentUser.role || 'member'}
+                    </span>
+                  </div>
+                  <p className="truncate font-mono text-[11px] text-zinc-400">
+                    {currentUser.email}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <span
+                  className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                    r2Configured
+                      ? 'bg-sky-500/15 text-sky-300'
+                      : 'bg-zinc-800 text-zinc-500'
+                  }`}
+                >
+                  {r2Configured ? 'R2 Vault Ready' : 'R2 Off'}
+                </span>
+                {onSignOut && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onSignOut();
+                    }}
+                    className="inline-flex items-center gap-1 rounded-lg border border-red-500/30 bg-red-500/10 px-2.5 py-1.5 text-[11px] font-semibold text-red-400 transition hover:bg-red-500/20"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                    Sign Out
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Custom Seek Interval */}
           <div>
             <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wider text-zinc-400">
@@ -401,7 +454,7 @@ export default function SettingsModal({
 
           <div className="flex items-center justify-between gap-2 pt-2">
             <span className="font-mono text-[10px] text-zinc-500">
-              StudyMedia v2.6 • Nov 22
+              StudyMedia v3.0 • Nov 22
             </span>
             <div className="flex items-center gap-2">
               <button

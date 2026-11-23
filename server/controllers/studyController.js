@@ -1,8 +1,12 @@
 const StudyItem = require('../models/StudyItem');
 const UserSettings = require('../models/UserSettings');
+const Playlist = require('../models/Playlist');
 const { getDBStatus } = require('../config/db');
+const { isR2Configured } = require('../services/r2Client');
 
 function getWorkspaceId(req) {
+  // Strictly scope all user records to req.user.id when authenticated
+  if (req.user?.id) return `user:${req.user.id}`;
   return (req.query.workspaceId || req.body?.workspaceId || 'default').trim() || 'default';
 }
 
@@ -48,6 +52,8 @@ exports.getHealth = (req, res) => {
     ok: true,
     service: 'StudyMedia API',
     dbConnected: getDBStatus(),
+    r2Configured: isR2Configured(),
+    authConfigured: Boolean(process.env.JWT_SECRET && process.env.INVITE_CODE),
     timestamp: new Date().toISOString(),
   });
 };
@@ -388,12 +394,151 @@ exports.updateSettings = async (req, res) => {
 
     const settings = await UserSettings.findOneAndUpdate(
       { workspaceId },
-      { $set: update, $setOnInsert: { workspaceId } },
+      {
+        $set: {
+          ...update,
+          ...(req.user?.id ? { userId: req.user.id } : {}),
+        },
+        $setOnInsert: { workspaceId },
+      },
       { upsert: true, new: true }
     ).lean();
 
     return res.json({ synced: true, settings });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to save settings', details: err.message });
+  }
+};
+
+/**
+ * GET /api/playlists
+ * Return all playlists owned by req.user.id PLUS any playlists with isSharedWithFriends: true.
+ */
+exports.getPlaylists = async (req, res) => {
+  if (!getDBStatus()) {
+    return res.json({ synced: false, playlists: [] });
+  }
+
+  try {
+    const docs = await Playlist.find({
+      $or: [{ userId: req.user.id }, { isSharedWithFriends: true }],
+    })
+      .populate('userId', 'displayName email')
+      .sort({ createdAt: 1 })
+      .lean();
+
+    const playlists = docs.map((doc) => {
+      const ownerId = doc.userId?._id ? String(doc.userId._id) : String(doc.userId);
+      const isOwner = ownerId === String(req.user.id);
+      return {
+        id: doc.playlistId,
+        playlistId: doc.playlistId,
+        name: doc.name,
+        isSharedWithFriends: Boolean(doc.isSharedWithFriends),
+        isOwner,
+        ownerName: doc.userId?.displayName || 'Friend',
+        createdAt: doc.createdAt || Date.now(),
+        updatedAt: doc.updatedAt || Date.now(),
+        items: Array.isArray(doc.items) ? doc.items : [],
+      };
+    });
+
+    return res.json({ synced: true, playlists });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch playlists', details: err.message });
+  }
+};
+
+/**
+ * PUT /api/playlists/sync
+ * Upsert req.user.id's owned playlists, item order, r2Key refs, and lastPosition timestamps.
+ */
+exports.syncPlaylists = async (req, res) => {
+  if (!getDBStatus()) {
+    return res.json({ synced: false });
+  }
+
+  const incoming = req.body?.playlists;
+  if (!Array.isArray(incoming)) {
+    return res.status(400).json({ error: 'playlists array is required' });
+  }
+
+  try {
+    const ownedPlaylists = incoming.filter((pl) => pl && pl.id && pl.isOwner !== false);
+    const keepIds = [];
+
+    for (const pl of ownedPlaylists) {
+      const playlistId = String(pl.id).trim();
+      if (!playlistId) continue;
+      keepIds.push(playlistId);
+
+      const cleanItems = Array.isArray(pl.items)
+        ? pl.items
+            .filter((item) => item && (item.id || item.videoId))
+            .map((item, idx) => {
+              const id = String(item.id || item.videoId);
+              // Persist R2 items, YouTube, Vimeo, Direct; strip transient device-only localBlobId
+              const effectiveSourceType =
+                item.sourceType === 'local' && item.r2Key
+                  ? 'r2'
+                  : item.sourceType === 'local' && item.sourceUrl
+                  ? 'youtube'
+                  : item.sourceType || 'youtube';
+
+              return {
+                id,
+                videoId: id,
+                sourceType: effectiveSourceType,
+                sourceUrl: item.sourceUrl || null,
+                r2Key: item.r2Key || null,
+                playlistId: item.playlistId || null,
+                playlistTitle: item.playlistTitle || null,
+                title: item.title || `Lecture (${id})`,
+                author: item.author || '',
+                // Avoid storing massive base64 canvas data URLs in MongoDB if they exceed 40KB
+                thumbnail:
+                  typeof item.thumbnail === 'string' && item.thumbnail.length <= 45000
+                    ? item.thumbnail
+                    : null,
+                duration: Number(item.duration) || 0,
+                lastPosition: Number(item.lastPosition) || 0,
+                mimeType: item.mimeType || null,
+                sizeBytes: item.sizeBytes ? Number(item.sizeBytes) : null,
+                queueOrder: idx,
+                lastWatchedAt: item.lastWatchedAt || new Date().toISOString(),
+              };
+            })
+        : [];
+
+      await Playlist.findOneAndUpdate(
+        { userId: req.user.id, playlistId },
+        {
+          $set: {
+            name: String(pl.name || 'Study Queue').trim() || 'Study Queue',
+            isSharedWithFriends: Boolean(pl.isSharedWithFriends),
+            items: cleanItems,
+            updatedAt: Number(pl.updatedAt) || Date.now(),
+          },
+          $setOnInsert: {
+            userId: req.user.id,
+            playlistId,
+            createdAt: Number(pl.createdAt) || Date.now(),
+          },
+        },
+        { upsert: true }
+      );
+    }
+
+    // Remove owned playlists that the user deleted locally (only when keepIds is non-empty so an empty bug never wipes DB)
+    if (keepIds.length > 0) {
+      await Playlist.deleteMany({
+        userId: req.user.id,
+        playlistId: { $nin: keepIds },
+      });
+    }
+
+    return res.json({ synced: true, count: keepIds.length });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to sync playlists', details: err.message });
   }
 };

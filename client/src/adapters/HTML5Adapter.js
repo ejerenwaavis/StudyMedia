@@ -1,6 +1,7 @@
 import { MediaAdapter } from './MediaAdapter';
 import { getMediaFile } from '../storage/mediaDB';
 import { isAudioItem } from '../utils/sourceDetector';
+import { getR2StreamUrl } from '../utils/r2Client';
 
 export class HTML5Adapter extends MediaAdapter {
   constructor(container, callbacks) {
@@ -38,12 +39,19 @@ export class HTML5Adapter extends MediaAdapter {
     let srcUrl = null;
     let isAudio = isAudioItem(source);
 
-    if (source.sourceType === 'local' || source.localBlobId) {
+    // Priority 1: Local IndexedDB Blob (0 R2 / network requests!)
+    if (source.localBlobId || (source.sourceType === 'local' && !source.r2Key)) {
       try {
         const record = await getMediaFile(source.localBlobId || source.id);
         if (this.destroyed) return;
 
-        if (!record || !record.blob) {
+        if (record && record.blob) {
+          if (record.mimeType && record.mimeType.toLowerCase().startsWith('audio/')) {
+            isAudio = true;
+          }
+          this.objectUrl = URL.createObjectURL(record.blob);
+          srcUrl = this.objectUrl;
+        } else if (!source.r2Key) {
           this.callbacks.onError({
             code: 'LOCAL_FILE_MISSING',
             message: 'This local media file is no longer in offline storage. Re-import the file to play it.',
@@ -51,24 +59,47 @@ export class HTML5Adapter extends MediaAdapter {
           });
           return;
         }
-
-        if (record.mimeType && record.mimeType.toLowerCase().startsWith('audio/')) {
-          isAudio = true;
-        }
-
-        this.objectUrl = URL.createObjectURL(record.blob);
-        srcUrl = this.objectUrl;
       } catch {
+        if (!source.r2Key) {
+          if (!this.destroyed) {
+            this.callbacks.onError({
+              code: 'LOCAL_DB_ERROR',
+              message: 'Failed to read local media from IndexedDB storage.',
+              recoverable: true,
+            });
+          }
+          return;
+        }
+      }
+    }
+
+    // Priority 2: Cloudflare R2 Cloud Vault via fresh 4-hour Presigned GET URL
+    if (!srcUrl && source.r2Key) {
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        this.callbacks.onError({
+          code: 'OFFLINE_UNAVAILABLE',
+          message: 'Internet connection required to stream from Cloud Vault. Use "Save Offline" while online for Airplane Mode.',
+          recoverable: true,
+        });
+        return;
+      }
+      try {
+        srcUrl = await getR2StreamUrl(source.r2Key);
+        if (this.destroyed) return;
+      } catch (err) {
         if (!this.destroyed) {
           this.callbacks.onError({
-            code: 'LOCAL_DB_ERROR',
-            message: 'Failed to read local media from IndexedDB storage.',
+            code: 'R2_STREAM_ERROR',
+            message: err?.message || 'Failed to load Cloud Vault stream URL.',
             recoverable: true,
           });
         }
         return;
       }
-    } else if (source.sourceUrl) {
+    }
+
+    // Priority 3: Direct media URL
+    if (!srcUrl && source.sourceUrl) {
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         this.callbacks.onError({
           code: 'OFFLINE_UNAVAILABLE',
@@ -78,10 +109,12 @@ export class HTML5Adapter extends MediaAdapter {
         return;
       }
       srcUrl = source.sourceUrl;
-    } else {
+    }
+
+    if (!srcUrl) {
       this.callbacks.onError({
         code: 'INVALID_SOURCE',
-        message: 'No valid media URL or local file found for this item.',
+        message: 'No valid media URL, Cloud Vault key, or local file found for this item.',
         recoverable: false,
       });
       return;

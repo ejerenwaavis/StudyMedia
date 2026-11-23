@@ -34,10 +34,22 @@ import QueuePanel from './components/QueuePanel';
 import CarControlDeck from './components/CarControlDeck';
 import SettingsModal from './components/SettingsModal';
 import SpeedPopover from './components/SpeedPopover';
+import AuthGate from './components/AuthGate';
 import { useMediaSession } from './hooks/useMediaSession';
 import { useWakeLock } from './hooks/useWakeLock';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { formatTime } from './utils/youtube';
+import {
+  getSavedAuth,
+  clearAuth,
+  authFetch,
+  fetchCurrentUser,
+} from './utils/authClient';
+import {
+  uploadLocalItemToR2,
+  downloadR2ItemOffline,
+  deleteR2CloudObject,
+} from './utils/r2Client';
 import {
   detectSourceFromUrl,
   createLocalQueueItem,
@@ -65,10 +77,14 @@ const DEFAULT_PLAYLIST_ID = 'default';
 const INTERVAL_PRESETS = [5, 10, 15, 30, 60];
 
 function createDefaultPlaylist(items = []) {
+  const now = Date.now();
   return {
     id: DEFAULT_PLAYLIST_ID,
     name: 'Study Queue',
-    createdAt: Date.now(),
+    isSharedWithFriends: false,
+    isOwner: true,
+    createdAt: now,
+    updatedAt: now,
     items,
   };
 }
@@ -78,14 +94,146 @@ function normalizePlaylists(rawPlaylists) {
   const cleaned = rawPlaylists
     .filter((pl) => pl && typeof pl === 'object')
     .map((pl, idx) => ({
-      id: String(pl.id || `pl_${Date.now()}_${idx}`),
-      name: String(pl.name || (idx === 0 ? 'Study Queue' : `Playlist ${idx + 1}`)).trim() || 'Study Queue',
+      id: String(pl.id || pl.playlistId || `pl_${Date.now()}_${idx}`),
+      name:
+        String(pl.name || (idx === 0 ? 'Study Queue' : `Playlist ${idx + 1}`)).trim() ||
+        'Study Queue',
+      isSharedWithFriends: Boolean(pl.isSharedWithFriends),
+      isOwner: pl.isOwner !== undefined ? Boolean(pl.isOwner) : true,
+      ownerName: pl.ownerName || null,
       createdAt: Number(pl.createdAt) || Date.now(),
+      updatedAt: Number(pl.updatedAt) || Number(pl.createdAt) || Date.now(),
       items: Array.isArray(pl.items)
         ? pl.items.map(normalizeQueueItem).filter(Boolean)
         : [],
     }));
   return cleaned.length > 0 ? cleaned : null;
+}
+
+/**
+ * Offline-first merge of localStorage playlists with MongoDB server playlists.
+ * NEVER overwrites non-empty local playlists with an empty server array.
+ * Preserves local IndexedDB offline blobs, r2Key refs, and highest playback timestamps.
+ */
+function mergeServerPlaylists(localPlaylists, serverPlaylists) {
+  const localList = Array.isArray(localPlaylists) ? localPlaylists : [];
+  const serverList = normalizePlaylists(serverPlaylists) || [];
+
+  // Never wipe non-empty local playlists when server returns empty
+  if (serverList.length === 0) {
+    const hasLocalContent = localList.some(
+      (pl) => (pl.isOwner !== false && pl.items.length > 0) || pl.id !== DEFAULT_PLAYLIST_ID
+    );
+    return { merged: localList, shouldPushLocal: hasLocalContent };
+  }
+
+  // Collect all device-local offline IndexedDB blobs so cloud sync never drops offline readiness
+  const localItemById = new Map();
+  for (const pl of localList) {
+    for (const item of pl.items || []) {
+      const prev = localItemById.get(item.id);
+      if (!prev || item.isOfflineReady || (item.lastPosition || 0) > (prev.lastPosition || 0)) {
+        localItemById.set(item.id, item);
+      }
+    }
+  }
+
+  const mergeItemWithLocal = (item) => {
+    const localCopy = localItemById.get(item.id);
+    if (!localCopy) return item;
+    return {
+      ...item,
+      r2Key: item.r2Key || localCopy.r2Key || null,
+      localBlobId: localCopy.isOfflineReady ? localCopy.localBlobId : item.localBlobId || null,
+      isOfflineReady: Boolean(localCopy.isOfflineReady && localCopy.localBlobId),
+      sourceType:
+        localCopy.isOfflineReady && localCopy.localBlobId
+          ? 'local'
+          : item.r2Key || localCopy.r2Key
+          ? 'r2'
+          : item.sourceType,
+      sizeBytes: localCopy.sizeBytes || item.sizeBytes || null,
+      lastPosition: Math.max(item.lastPosition || 0, localCopy.lastPosition || 0),
+    };
+  };
+
+  const localOwnedById = new Map(
+    localList.filter((pl) => pl.isOwner !== false).map((pl) => [pl.id, pl])
+  );
+  const serverOwnedById = new Map(
+    serverList.filter((pl) => pl.isOwner !== false).map((pl) => [pl.id, pl])
+  );
+  const serverShared = serverList.filter((pl) => pl.isOwner === false);
+
+  const mergedOwned = [];
+  const seenIds = new Set();
+  let shouldPushLocal = false;
+
+  // 1. Merge playlists present on server (prefer newer updatedAt, always keep local blobs/r2Keys)
+  for (const [id, remotePl] of serverOwnedById.entries()) {
+    seenIds.add(id);
+    const localPl = localOwnedById.get(id);
+    if (!localPl) {
+      mergedOwned.push({
+        ...remotePl,
+        items: remotePl.items.map(mergeItemWithLocal),
+      });
+    } else if ((localPl.updatedAt || 0) > (remotePl.updatedAt || 0)) {
+      // Local is newer -> keep local structure but absorb any remote r2Key updates
+      const remoteItemMap = new Map(remotePl.items.map((i) => [i.id, i]));
+      mergedOwned.push({
+        ...localPl,
+        items: localPl.items.map((item) => {
+          const r = remoteItemMap.get(item.id);
+          return r
+            ? {
+                ...item,
+                r2Key: item.r2Key || r.r2Key || null,
+                lastPosition: Math.max(item.lastPosition || 0, r.lastPosition || 0),
+              }
+            : item;
+        }),
+      });
+      shouldPushLocal = true;
+    } else {
+      // Server is newer or equal -> adopt server order/items, preserve local offline blobs & any local-only items
+      const remoteIds = new Set(remotePl.items.map((i) => i.id));
+      const localOnlyOffline = localPl.items.filter(
+        (i) => !remoteIds.has(i.id) && i.isOfflineReady && !i.sourceUrl && !i.r2Key
+      );
+      mergedOwned.push({
+        ...remotePl,
+        items: [...remotePl.items.map(mergeItemWithLocal), ...localOnlyOffline],
+      });
+    }
+  }
+
+  // 2. Preserve any locally created owned playlists not yet on server
+  for (const [id, localPl] of localOwnedById.entries()) {
+    if (!seenIds.has(id)) {
+      if (localPl.items.length > 0 || id !== DEFAULT_PLAYLIST_ID) {
+        mergedOwned.push(localPl);
+        shouldPushLocal = true;
+      }
+    }
+  }
+
+  // Ensure at least one owned playlist always exists
+  if (mergedOwned.length === 0) {
+    mergedOwned.push(createDefaultPlaylist([]));
+  }
+
+  // 3. Append friend-shared playlists (hydrating any local offline copies)
+  const mergedShared = serverShared.map((pl) => ({
+    ...pl,
+    isOwner: false,
+    items: pl.items.map(mergeItemWithLocal),
+  }));
+
+  return {
+    merged: [...mergedOwned, ...mergedShared],
+    shouldPushLocal,
+  };
 }
 
 /**
@@ -150,6 +298,12 @@ function loadLocalState() {
 export default function App() {
   const initialLocal = useMemo(() => loadLocalState(), []);
   const initialSidecar = useMemo(() => loadSidecarConfig(), []);
+
+  // Invite-only JWT authentication state (hydrated immediately for Airplane Mode support)
+  const [auth, setAuth] = useState(() => getSavedAuth());
+  const [r2Configured, setR2Configured] = useState(false);
+  const [r2Transfer, setR2Transfer] = useState(null); // null | { itemId, type: 'upload'|'download', pct }
+  const initialServerSyncDoneRef = useRef(false);
 
   const [workspaceId, setWorkspaceId] = useState(initialLocal?.workspaceId || 'default');
   const [playlists, setPlaylists] = useState(
@@ -275,15 +429,23 @@ export default function App() {
     return /[?&]list=[a-zA-Z0-9_-]{8,}/i.test(trimmed);
   }, [urlInput]);
 
-  // Helper: update a single item consistently across ALL playlists and history
+  // Helper: update a single item consistently across ALL playlists and history (bumping updatedAt on owned playlists)
   const updateItemAcrossAll = useCallback((itemId, updater) => {
+    const now = Date.now();
     setPlaylists((prev) =>
-      prev.map((pl) => ({
-        ...pl,
-        items: pl.items.map((item) =>
-          item.id === itemId ? updater(item) : item
-        ),
-      }))
+      prev.map((pl) => {
+        let changed = false;
+        const nextItems = pl.items.map((item) => {
+          if (item.id === itemId) {
+            changed = true;
+            return updater(item);
+          }
+          return item;
+        });
+        return changed
+          ? { ...pl, items: nextItems, updatedAt: pl.isOwner !== false ? now : pl.updatedAt }
+          : pl;
+      })
     );
     setHistoryItems((prev) =>
       prev.map((item) => (item.id === itemId ? updater(item) : item))
@@ -357,23 +519,87 @@ export default function App() {
     return () => window.removeEventListener('beforeinstallprompt', handler);
   }, []);
 
-  // Sync from MongoDB backend on mount / workspaceId change (safely preserving device-local offline items)
+  // Background JWT verification when online (NEVER blocks offline Airplane Mode entry)
   useEffect(() => {
-    if (!isOnline) return;
+    if (!isOnline || !auth?.token) return;
     let cancelled = false;
+    fetchCurrentUser()
+      .then((res) => {
+        if (cancelled) return;
+        if (res.unauthorized) {
+          clearAuth();
+          setAuth(null);
+        } else if (res.user) {
+          setAuth((prev) => (prev ? { ...prev, user: res.user } : prev));
+        }
+      })
+      .catch(() => {
+        // Stay signed in on transient network error
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOnline, auth?.token]);
+
+  // Helper to push owned playlists to MongoDB PUT /api/playlists/sync
+  const pushPlaylistsToServer = useCallback(
+    async (playlistArray) => {
+      if (!isOnline || !auth?.token) return;
+      const owned = (playlistArray || []).filter((pl) => pl.isOwner !== false);
+      try {
+        await authFetch('/api/playlists/sync', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ playlists: owned }),
+        });
+      } catch {
+        // Ignore offline/transient errors; localStorage remains source of truth
+      }
+    },
+    [isOnline, auth?.token]
+  );
+
+  // Sync from MongoDB backend on mount / login (Offline-First Merge: NEVER wipes local playlists)
+  useEffect(() => {
+    if (!isOnline || !auth?.token) return;
+    let cancelled = false;
+    initialServerSyncDoneRef.current = false;
+
     async function syncFromServer() {
       try {
         const healthRes = await fetch('/api/health');
         const health = await healthRes.json();
-        if (!cancelled) setDbConnected(Boolean(health?.dbConnected));
+        if (!cancelled) {
+          setDbConnected(Boolean(health?.dbConnected));
+          setR2Configured(Boolean(health?.r2Configured));
+        }
 
-        if (!health?.dbConnected) return;
+        if (!health?.dbConnected) {
+          initialServerSyncDoneRef.current = true;
+          return;
+        }
 
-        const stateRes = await fetch(`/api/state?workspaceId=${encodeURIComponent(workspaceId)}`);
-        const data = await stateRes.json();
-        if (cancelled || !data?.synced) return;
+        const [stateRes, playlistsRes] = await Promise.all([
+          authFetch(`/api/state?workspaceId=${encodeURIComponent(workspaceId)}`),
+          authFetch('/api/playlists'),
+        ]);
 
-        if (data.settings) {
+        if (stateRes.status === 401 || playlistsRes.status === 401) {
+          if (!cancelled) {
+            clearAuth();
+            setAuth(null);
+          }
+          return;
+        }
+
+        const [data, plData] = await Promise.all([
+          stateRes.json().catch(() => ({})),
+          playlistsRes.json().catch(() => ({})),
+        ]);
+
+        if (cancelled) return;
+
+        if (data?.synced && data.settings) {
           if (data.settings.seekInterval) setSeekInterval(data.settings.seekInterval);
           if (data.settings.playbackSpeed) setPlaybackSpeed(data.settings.playbackSpeed);
           if (data.settings.doubleTapToSkip !== undefined)
@@ -390,85 +616,72 @@ export default function App() {
             setSidecarApiKey(data.settings.sidecarApiKey);
           if (data.settings.fallbackConverterUrl)
             setFallbackConverterUrl(data.settings.fallbackConverterUrl);
+        }
 
-          const remotePlaylists = normalizePlaylists(data.settings.playlists);
-          if (remotePlaylists) {
-            setPlaylists((prev) => {
-              const localOfflineById = new Map();
-              for (const pl of prev) {
-                for (const item of pl.items) {
-                  if (item.isOfflineReady) localOfflineById.set(item.id, item);
-                }
-              }
-              return remotePlaylists.map((pl) => ({
-                ...pl,
-                items: pl.items.map((item) => {
-                  const localCopy = localOfflineById.get(item.id);
-                  return localCopy
-                    ? {
-                        ...item,
-                        ...localCopy,
-                        lastPosition: Math.max(item.lastPosition || 0, localCopy.lastPosition || 0),
-                      }
-                    : item;
-                }),
-              }));
-            });
+        if (plData?.synced && Array.isArray(plData.playlists)) {
+          let pendingPush = null;
+          setPlaylists((prevLocal) => {
+            const { merged, shouldPushLocal } = mergeServerPlaylists(prevLocal, plData.playlists);
+            if (shouldPushLocal) pendingPush = merged;
+            return merged;
+          });
+          if (pendingPush) {
+            pushPlaylistsToServer(pendingPush);
           }
         }
 
-        if (Array.isArray(data.items) && data.items.length > 0) {
+        if (Array.isArray(data?.items) && data.items.length > 0) {
           const remoteNormalized = data.items.map(normalizeQueueItem).filter(Boolean);
           upsertHistoryItems(remoteNormalized);
         }
       } catch {
         // Offline or local-only fallback
+      } finally {
+        if (!cancelled) {
+          initialServerSyncDoneRef.current = true;
+        }
       }
     }
+
     syncFromServer();
     return () => {
       cancelled = true;
     };
-  }, [workspaceId, isOnline]);
+  }, [workspaceId, isOnline, auth?.token, pushPlaylistsToServer]);
 
   const syncSettingsToServer = useCallback(
     (patch) => {
-      if (!isOnline) return;
-      fetch('/api/settings', {
+      if (!isOnline || !auth?.token) return;
+      authFetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ workspaceId, ...patch }),
       }).catch(() => {});
     },
-    [workspaceId, isOnline]
+    [workspaceId, isOnline, auth?.token]
   );
 
-  // Sync non-local playlist structure to MongoDB when playlists change (debounced)
+  // Debounced (1.5s) automatic PUT /api/playlists/sync whenever owned playlists change
   useEffect(() => {
-    if (!isOnline || !dbConnected) return;
+    if (!isOnline || !dbConnected || !auth?.token || !initialServerSyncDoneRef.current) return;
     const timer = setTimeout(() => {
-      const syncablePlaylists = playlists.map((pl) => ({
-        id: pl.id,
-        name: pl.name,
-        createdAt: pl.createdAt,
-        items: pl.items
-          .filter((i) => i.sourceType !== 'local' || i.sourceUrl)
-          .map((i) => ({
-            ...i,
-            // Never push local blob IDs to other devices
-            localBlobId: null,
-            isOfflineReady: false,
-          })),
-      }));
-      syncSettingsToServer({ playlists: syncablePlaylists });
+      pushPlaylistsToServer(playlists);
     }, 1500);
     return () => clearTimeout(timer);
-  }, [playlists, isOnline, dbConnected, syncSettingsToServer]);
+  }, [playlists, isOnline, dbConnected, auth?.token, pushPlaylistsToServer]);
 
   const syncItemToServer = useCallback(
     (item) => {
-      if (!isOnline || !item || item.sourceType === 'local' || item.id.startsWith('local:')) return;
-      fetch('/api/items', {
+      if (
+        !isOnline ||
+        !auth?.token ||
+        !item ||
+        item.sourceType === 'local' ||
+        item.id.startsWith('local:')
+      ) {
+        return;
+      }
+      authFetch('/api/items', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -488,7 +701,7 @@ export default function App() {
         }),
       }).catch(() => {});
     },
-    [workspaceId, isOnline]
+    [workspaceId, isOnline, auth?.token]
   );
 
   // Playable track list & Prev/Next boundary flags (skips online-only items when offline)
@@ -641,11 +854,15 @@ export default function App() {
 
   const handleCreatePlaylist = useCallback(
     (name) => {
-      const id = `pl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const now = Date.now();
+      const id = `pl_${now}_${Math.random().toString(36).slice(2, 6)}`;
       const newPlaylist = {
         id,
         name: name.trim() || 'Untitled Playlist',
-        createdAt: Date.now(),
+        isSharedWithFriends: false,
+        isOwner: true,
+        createdAt: now,
+        updatedAt: now,
         items: [],
       };
       setPlaylists((prev) => [...prev, newPlaylist]);
@@ -659,10 +876,31 @@ export default function App() {
     (playlistId, nextName) => {
       const clean = nextName.trim();
       if (!clean) return;
+      const now = Date.now();
       setPlaylists((prev) =>
-        prev.map((pl) => (pl.id === playlistId ? { ...pl, name: clean } : pl))
+        prev.map((pl) => (pl.id === playlistId ? { ...pl, name: clean, updatedAt: now } : pl))
       );
       showNotice(`Renamed playlist to "${clean}"`, 'info');
+    },
+    [showNotice]
+  );
+
+  const handleToggleSharePlaylist = useCallback(
+    (playlistId) => {
+      const now = Date.now();
+      setPlaylists((prev) =>
+        prev.map((pl) => {
+          if (pl.id !== playlistId || pl.isOwner === false) return pl;
+          const nextShared = !pl.isSharedWithFriends;
+          showNotice(
+            nextShared
+              ? `Shared "${pl.name}" with friends`
+              : `"${pl.name}" is now private`,
+            'info'
+          );
+          return { ...pl, isSharedWithFriends: nextShared, updatedAt: now };
+        })
+      );
     },
     [showNotice]
   );
@@ -670,7 +908,8 @@ export default function App() {
   const handleDeletePlaylist = useCallback(
     (playlistId) => {
       setPlaylists((prev) => {
-        if (prev.length <= 1) return prev;
+        const ownedCount = prev.filter((pl) => pl.isOwner !== false).length;
+        if (ownedCount <= 1) return prev;
         const remaining = prev.filter((pl) => pl.id !== playlistId);
         if (activePlaylistId === playlistId && remaining[0]) {
           setActivePlaylistId(remaining[0].id);
@@ -685,9 +924,10 @@ export default function App() {
   // Touch & Pointer Drag-and-Drop / Move Up-Down reordering (never disturbs active playback!)
   const handleMoveQueueItem = useCallback(
     (fromIdx, toIdx) => {
+      const now = Date.now();
       setPlaylists((prev) =>
         prev.map((pl) => {
-          if (pl.id !== activePlaylist.id) return pl;
+          if (pl.id !== activePlaylist.id || pl.isOwner === false) return pl;
           if (
             fromIdx < 0 ||
             toIdx < 0 ||
@@ -700,7 +940,7 @@ export default function App() {
             ...item,
             queueOrder: idx,
           }));
-          return { ...pl, items: reordered };
+          return { ...pl, items: reordered, updatedAt: now };
         })
       );
     },
@@ -762,11 +1002,13 @@ export default function App() {
           importedCount += 1;
 
           // Append each completed file immediately into the active playlist & history
+          const now = Date.now();
           setPlaylists((prev) =>
             prev.map((pl) =>
               pl.id === targetPlaylistId
                 ? {
                     ...pl,
+                    updatedAt: now,
                     items: [...pl.items, { ...newItem, queueOrder: pl.items.length }],
                   }
                 : pl
@@ -1047,11 +1289,15 @@ export default function App() {
           );
 
           if (playlistImportMode === 'new') {
-            const newPlId = `pl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+            const now = Date.now();
+            const newPlId = `pl_${now}_${Math.random().toString(36).slice(2, 6)}`;
             const newNamedPlaylist = {
               id: newPlId,
               name: ytPlaylistName,
-              createdAt: Date.now(),
+              isSharedWithFriends: false,
+              isOwner: true,
+              createdAt: now,
+              updatedAt: now,
               items: playlistItems,
             };
             setPlaylists((prev) => [...prev, newNamedPlaylist]);
@@ -1059,6 +1305,7 @@ export default function App() {
           } else {
             // Append into currently active playlist (deduplicating by id)
             const targetId = activePlaylist.id;
+            const now = Date.now();
             setPlaylists((prev) =>
               prev.map((pl) => {
                 if (pl.id !== targetId) return pl;
@@ -1068,7 +1315,7 @@ export default function App() {
                   ...item,
                   queueOrder: i,
                 }));
-                return { ...pl, items: merged };
+                return { ...pl, items: merged, updatedAt: now };
               })
             );
           }
@@ -1110,6 +1357,7 @@ export default function App() {
     });
 
     const targetPlaylistId = activePlaylist.id;
+    const nowTs = Date.now();
     setPlaylists((prev) =>
       prev.map((pl) => {
         if (pl.id !== targetPlaylistId) return pl;
@@ -1117,6 +1365,7 @@ export default function App() {
         if (exists) {
           return {
             ...pl,
+            updatedAt: nowTs,
             items: pl.items.map((i) =>
               i.id === newItem.id
                 ? { ...i, playlistId: newItem.playlistId || i.playlistId }
@@ -1126,6 +1375,7 @@ export default function App() {
         }
         return {
           ...pl,
+          updatedAt: nowTs,
           items: [...pl.items, { ...newItem, queueOrder: pl.items.length }],
         };
       })
@@ -1189,11 +1439,12 @@ export default function App() {
 
       if (
         isOnline &&
+        auth?.token &&
         activeItem &&
         activeItem.sourceType !== 'local' &&
         !activeItemId.startsWith('local:')
       ) {
-        fetch('/api/progress', {
+        authFetch('/api/progress', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1207,7 +1458,7 @@ export default function App() {
         }).catch(() => {});
       }
     },
-    [activeItemId, activeItem, workspaceId, isOnline, updateItemAcrossAll]
+    [activeItemId, activeItem, workspaceId, isOnline, auth?.token, updateItemAcrossAll]
   );
 
   const handleSelectVideo = (item) => {
@@ -1219,11 +1470,13 @@ export default function App() {
   };
 
   const handleRemoveFromQueue = (itemId) => {
+    const now = Date.now();
     setPlaylists((prev) =>
       prev.map((pl) =>
         pl.id === activePlaylist.id
           ? {
               ...pl,
+              updatedAt: now,
               items: pl.items
                 .filter((i) => i.id !== itemId)
                 .map((item, idx) => ({ ...item, queueOrder: idx })),
@@ -1231,10 +1484,11 @@ export default function App() {
           : pl
       )
     );
-    if (isOnline && !itemId.startsWith('local:')) {
-      fetch(`/api/items/${encodeURIComponent(itemId)}?workspaceId=${encodeURIComponent(workspaceId)}`, {
-        method: 'DELETE',
-      }).catch(() => {});
+    if (isOnline && auth?.token && !itemId.startsWith('local:')) {
+      authFetch(
+        `/api/items/${encodeURIComponent(itemId)}?workspaceId=${encodeURIComponent(workspaceId)}`,
+        { method: 'DELETE' }
+      ).catch(() => {});
     }
   };
 
@@ -1243,17 +1497,23 @@ export default function App() {
     if (target?.localBlobId) {
       await deleteMediaFile(target.localBlobId).catch(() => {});
     }
+    const now = Date.now();
     setHistoryItems((prev) => prev.filter((i) => i.id !== itemId));
     setPlaylists((prev) =>
-      prev.map((pl) => ({
-        ...pl,
-        items: pl.items.filter((i) => i.id !== itemId),
-      }))
+      prev.map((pl) =>
+        pl.isOwner === false
+          ? pl
+          : {
+              ...pl,
+              updatedAt: now,
+              items: pl.items.filter((i) => i.id !== itemId),
+            }
+      )
     );
     if (activeItemId === itemId) setActiveItemId(null);
 
-    if (isOnline && !itemId.startsWith('local:')) {
-      fetch(
+    if (isOnline && auth?.token && !itemId.startsWith('local:')) {
+      authFetch(
         `/api/items/${encodeURIComponent(itemId)}?workspaceId=${encodeURIComponent(workspaceId)}&hard=true`,
         { method: 'DELETE' }
       ).catch(() => {});
@@ -1267,7 +1527,15 @@ export default function App() {
       await deleteMediaFile(blobId).catch(() => {});
     }
 
-    if (item.sourceUrl) {
+    if (item.r2Key) {
+      updateItemAcrossAll(item.id, (i) => ({
+        ...i,
+        sourceType: 'r2',
+        localBlobId: null,
+        isOfflineReady: false,
+      }));
+      showNotice(`Deleted local copy of "${item.title}" — still available in Cloud Vault.`, 'info');
+    } else if (item.sourceUrl) {
       const detected = detectSourceFromUrl(item.sourceUrl);
       updateItemAcrossAll(item.id, (i) => ({
         ...i,
@@ -1278,17 +1546,121 @@ export default function App() {
       }));
       showNotice(`Deleted offline copy of "${item.title}" to free storage.`, 'info');
     } else {
+      const now = Date.now();
       setPlaylists((prev) =>
-        prev.map((pl) => ({
-          ...pl,
-          items: pl.items.filter((i) => i.id !== item.id),
-        }))
+        prev.map((pl) =>
+          pl.isOwner === false
+            ? pl
+            : { ...pl, updatedAt: now, items: pl.items.filter((i) => i.id !== item.id) }
+        )
       );
       setHistoryItems((prev) => prev.filter((i) => i.id !== item.id));
       if (activeItemId === item.id) setActiveItemId(null);
       showNotice(`Deleted local file "${item.title}" from device storage.`, 'info');
     }
   };
+
+  // --- Cloudflare R2 Cloud Vault Handlers ---
+  const handleUploadToR2 = useCallback(
+    async (item) => {
+      if (!item || !isOnline || !auth?.token) return;
+      setR2Transfer({ itemId: item.id, type: 'upload', pct: 0 });
+      showNotice(`Uploading "${item.title}" to Cloud Vault...`, 'info');
+      try {
+        const { r2Key, mimeType, sizeBytes } = await uploadLocalItemToR2({
+          item,
+          onProgress: ({ pct }) => setR2Transfer({ itemId: item.id, type: 'upload', pct }),
+        });
+        updateItemAcrossAll(item.id, (i) => ({
+          ...i,
+          r2Key,
+          mimeType: mimeType || i.mimeType,
+          sizeBytes: sizeBytes || i.sizeBytes,
+        }));
+        showNotice(`Saved "${item.title}" to Cloudflare R2 Cloud Vault!`, 'success');
+      } catch (err) {
+        showNotice(err?.message || 'Cloud Vault upload failed.', 'error');
+      } finally {
+        setR2Transfer(null);
+      }
+    },
+    [isOnline, auth?.token, showNotice, updateItemAcrossAll]
+  );
+
+  const handleSaveR2Offline = useCallback(
+    async (item) => {
+      if (!item?.r2Key || !isOnline || !auth?.token) return;
+      setR2Transfer({ itemId: item.id, type: 'download', pct: 0 });
+      showNotice(`Downloading "${item.title}" for Offline Mode...`, 'info');
+      try {
+        const offlinePatch = await downloadR2ItemOffline({
+          item,
+          onProgress: ({ pct }) => setR2Transfer({ itemId: item.id, type: 'download', pct }),
+        });
+        updateItemAcrossAll(item.id, (i) => ({
+          ...i,
+          ...offlinePatch,
+          sourceType: 'local',
+        }));
+        showNotice(`"${item.title}" is now Offline Ready (0 Cloud requests on future plays)!`, 'success');
+      } catch (err) {
+        showNotice(err?.message || 'Failed to download from Cloud Vault.', 'error');
+      } finally {
+        setR2Transfer(null);
+      }
+    },
+    [isOnline, auth?.token, showNotice, updateItemAcrossAll]
+  );
+
+  const handleDeleteFromR2 = useCallback(
+    async (item) => {
+      if (!item?.r2Key || !isOnline || !auth?.token) return;
+      setR2Transfer({ itemId: item.id, type: 'delete', pct: null });
+      try {
+        await deleteR2CloudObject(item.r2Key);
+        if (item.isOfflineReady || item.sourceUrl) {
+          const detected = item.sourceUrl ? detectSourceFromUrl(item.sourceUrl) : null;
+          updateItemAcrossAll(item.id, (i) => ({
+            ...i,
+            r2Key: null,
+            sourceType: i.isOfflineReady ? 'local' : detected?.sourceType || 'youtube',
+          }));
+        } else {
+          const now = Date.now();
+          setPlaylists((prev) =>
+            prev.map((pl) =>
+              pl.isOwner === false
+                ? pl
+                : { ...pl, updatedAt: now, items: pl.items.filter((i) => i.id !== item.id) }
+            )
+          );
+          setHistoryItems((prev) => prev.filter((i) => i.id !== item.id));
+          if (activeItemId === item.id) setActiveItemId(null);
+        }
+        showNotice(`Removed "${item.title}" from Cloud Vault.`, 'info');
+      } catch (err) {
+        showNotice(err?.message || 'Failed to delete from Cloud Vault.', 'error');
+      } finally {
+        setR2Transfer(null);
+      }
+    },
+    [isOnline, auth?.token, activeItemId, showNotice, updateItemAcrossAll]
+  );
+
+  const handleAuthenticated = useCallback(
+    (data) => {
+      setAuth({ token: data.token, user: data.user });
+      showNotice(`Welcome back, ${data.user?.displayName || 'Student'}!`, 'success');
+    },
+    [showNotice]
+  );
+
+  const handleSignOut = useCallback(() => {
+    clearAuth();
+    setAuth(null);
+    setActiveItemId(null);
+    initialServerSyncDoneRef.current = false;
+  }, []);
 
   // Wipe all IndexedDB blobs from Settings Modal
   const handleClearOfflineMedia = async () => {
@@ -1297,6 +1669,14 @@ export default function App() {
       list
         .map((i) => {
           if (!i.isOfflineReady && i.sourceType !== 'local') return i;
+          if (i.r2Key) {
+            return {
+              ...i,
+              sourceType: 'r2',
+              localBlobId: null,
+              isOfflineReady: false,
+            };
+          }
           if (i.sourceUrl) {
             const detected = detectSourceFromUrl(i.sourceUrl);
             return {
@@ -1379,8 +1759,11 @@ export default function App() {
     queue,
     history,
     activeItemId,
+    currentUser: auth?.user || null,
     isOnline,
     sidecarConfigured,
+    r2Configured,
+    r2Transfer,
     fallbackConverterUrl,
     extractingItemId,
     localImportProgress,
@@ -1390,10 +1773,14 @@ export default function App() {
     onCreatePlaylist: handleCreatePlaylist,
     onRenamePlaylist: handleRenamePlaylist,
     onDeletePlaylist: handleDeletePlaylist,
+    onToggleSharePlaylist: handleToggleSharePlaylist,
     onSelectVideo: handleSelectVideo,
     onRemoveFromQueue: handleRemoveFromQueue,
     onDeleteHistoryItem: handleDeleteHistoryItem,
     onDeleteLocalFile: handleDeleteLocalFile,
+    onUploadToR2: handleUploadToR2,
+    onSaveR2Offline: handleSaveR2Offline,
+    onDeleteFromR2: handleDeleteFromR2,
     onMoveQueueItem: handleMoveQueueItem,
     onReplaceWithLocalFile: handleReplaceWithLocalFile,
     onFetchViaSidecar: handleFetchViaSidecar,
@@ -1402,6 +1789,11 @@ export default function App() {
     onCancelPlaylistDownload: handleCancelPlaylistDownload,
     onNotify: showNotice,
   };
+
+  // Invite-Only Login Gate (if offline with saved token, auth.token is truthy -> instant offline entry!)
+  if (!auth?.token) {
+    return <AuthGate isOnline={isOnline} onAuthenticated={handleAuthenticated} />;
+  }
 
   return (
     <div className="min-h-screen bg-obsidian-950 text-zinc-100">
@@ -2023,10 +2415,13 @@ export default function App() {
         autoPlayNext={autoPlayNext}
         workspaceId={workspaceId}
         dbConnected={dbConnected}
+        r2Configured={r2Configured}
+        currentUser={auth?.user || null}
         sidecarUrl={sidecarUrl}
         sidecarApiKey={sidecarApiKey}
         fallbackConverterUrl={fallbackConverterUrl}
         onClearOfflineMedia={handleClearOfflineMedia}
+        onSignOut={handleSignOut}
         onSave={(next) => {
           setSeekInterval(next.seekInterval);
           setDoubleTapToSkip(next.doubleTapToSkip);

@@ -36,17 +36,24 @@ export class PlayerController {
     this.lastSeekAt = 0;
   }
 
-  _createAdapter(sourceType, callbacks) {
-    switch (sourceType) {
+  _createAdapter(source, callbacks) {
+    // Any item with a local IndexedDB blob OR Cloudflare R2 key uses native HTML5Adapter
+    if (source?.isOfflineReady && source?.localBlobId) {
+      return new HTML5Adapter(this.container, callbacks);
+    }
+    switch (source?.sourceType) {
       case 'youtube':
         return new YouTubeAdapter(this.container, callbacks);
       case 'vimeo':
         return new VimeoAdapter(this.container, callbacks);
       case 'local':
       case 'direct':
+      case 'r2':
         return new HTML5Adapter(this.container, callbacks);
       default:
-        return new YouTubeAdapter(this.container, callbacks);
+        return source?.r2Key
+          ? new HTML5Adapter(this.container, callbacks)
+          : new YouTubeAdapter(this.container, callbacks);
     }
   }
 
@@ -123,7 +130,7 @@ export class PlayerController {
       },
     };
 
-    this.adapter = this._createAdapter(source.sourceType, adapterCallbacks);
+    this.adapter = this._createAdapter(source, adapterCallbacks);
     await this.adapter.load(source, startTime, playbackRate);
   }
 

@@ -40,6 +40,11 @@ import {
   X,
   AlertCircle,
   Square,
+  CloudUpload,
+  CloudDownload,
+  Cloud,
+  CloudOff,
+  Users,
 } from 'lucide-react';
 import { formatTime } from '../utils/youtube';
 import { formatBytes } from '../storage/mediaDB';
@@ -54,6 +59,9 @@ function SortableQueueCard({
   isActive,
   isOnline,
   sidecarConfigured,
+  r2Configured,
+  r2Transfer,
+  canManageCloudItem,
   isExpanded,
   isCopied,
   isExtracting,
@@ -62,6 +70,9 @@ function SortableQueueCard({
   onMoveQueueItem,
   onRemove,
   onDeleteLocalFile,
+  onUploadToR2,
+  onSaveR2Offline,
+  onDeleteFromR2,
   onCopyUrl,
   onToggleExpand,
   onOpenExternalConverter,
@@ -178,6 +189,13 @@ function SortableQueueCard({
                 <HardDrive className="h-2.5 w-2.5" />
                 Offline Ready
                 {item.sizeBytes ? ` • ${formatBytes(item.sizeBytes)}` : ''}
+              </span>
+            )}
+
+            {item.r2Key && (
+              <span className="inline-flex items-center gap-0.5 rounded bg-sky-500/15 px-1.5 py-0.5 font-semibold text-sky-300">
+                <Cloud className="h-2.5 w-2.5" />
+                Cloud Vault
               </span>
             )}
 
@@ -334,21 +352,90 @@ function SortableQueueCard({
         </div>
       )}
 
-      {/* Per-item Delete Local File link for Offline Ready items */}
-      {item.isOfflineReady && onDeleteLocalFile && (
+      {/* Cloud Vault & Local Offline Storage Controls Row */}
+      {(item.isOfflineReady || item.r2Key) && (
         <div
           onClick={(e) => e.stopPropagation()}
-          className="mt-2 flex items-center justify-end border-t border-zinc-800/60 pt-1.5"
+          className="mt-2 flex flex-wrap items-center justify-between gap-1.5 border-t border-zinc-800/60 pt-1.5"
         >
-          <button
-            type="button"
-            onClick={() => onDeleteLocalFile(item)}
-            className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[10px] font-medium text-zinc-400 transition hover:bg-red-500/15 hover:text-red-400"
-            title="Delete local blob from IndexedDB to free device storage"
-          >
-            <FolderX className="h-3 w-3" />
-            Delete Local File
-          </button>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {/* Local item NOT yet in Cloud Vault -> Save to Cloud Vault */}
+            {item.isOfflineReady && !item.r2Key && onUploadToR2 && (
+              <button
+                type="button"
+                disabled={!isOnline || !r2Configured || Boolean(r2Transfer)}
+                onClick={() => onUploadToR2(item)}
+                title={
+                  r2Configured
+                    ? 'Upload to Cloudflare R2 Cloud Vault for cross-device streaming & sharing'
+                    : 'Configure Cloudflare R2 credentials on server to enable Cloud Vault'
+                }
+                className="inline-flex items-center gap-1 rounded-md bg-sky-500/15 px-2 py-0.5 text-[10px] font-semibold text-sky-300 transition hover:bg-sky-500/25 disabled:cursor-not-allowed disabled:opacity-45"
+              >
+                {r2Transfer?.itemId === itemId && r2Transfer.type === 'upload' ? (
+                  <>
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    Uploading {r2Transfer.pct ?? 0}%
+                  </>
+                ) : (
+                  <>
+                    <CloudUpload className="h-3 w-3" />
+                    Save to Cloud Vault
+                  </>
+                )}
+              </button>
+            )}
+
+            {/* Cloud Vault item NOT yet in local IndexedDB -> Save Offline */}
+            {item.r2Key && !item.isOfflineReady && onSaveR2Offline && (
+              <button
+                type="button"
+                disabled={!isOnline || Boolean(r2Transfer)}
+                onClick={() => onSaveR2Offline(item)}
+                title="Download from Cloud Vault into local IndexedDB (0 R2 requests on future plays)"
+                className="inline-flex items-center gap-1 rounded-md bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-300 transition hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-45"
+              >
+                {r2Transfer?.itemId === itemId && r2Transfer.type === 'download' ? (
+                  <>
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    Saving {r2Transfer.pct != null ? `${r2Transfer.pct}%` : '...'}
+                  </>
+                ) : (
+                  <>
+                    <CloudDownload className="h-3 w-3" />
+                    Save Offline
+                  </>
+                )}
+              </button>
+            )}
+          </div>
+
+          <div className="flex items-center gap-1.5">
+            {item.r2Key && canManageCloudItem && onDeleteFromR2 && (
+              <button
+                type="button"
+                disabled={!isOnline || Boolean(r2Transfer)}
+                onClick={() => onDeleteFromR2(item)}
+                className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[10px] font-medium text-zinc-400 transition hover:bg-red-500/15 hover:text-red-400 disabled:opacity-40"
+                title="Delete video from Cloudflare R2 Cloud Vault"
+              >
+                <CloudOff className="h-3 w-3" />
+                Delete Cloud
+              </button>
+            )}
+
+            {item.isOfflineReady && onDeleteLocalFile && (
+              <button
+                type="button"
+                onClick={() => onDeleteLocalFile(item)}
+                className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[10px] font-medium text-zinc-400 transition hover:bg-red-500/15 hover:text-red-400"
+                title="Delete local blob from IndexedDB to free device storage"
+              >
+                <FolderX className="h-3 w-3" />
+                Delete Local
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -381,14 +468,16 @@ function SortableQueueCard({
             )}
           </>
         )}
-        <button
-          type="button"
-          onClick={() => onRemove(itemId)}
-          className="rounded bg-obsidian-800/95 p-1 text-zinc-400 hover:bg-red-500/20 hover:text-red-400"
-          title={tab === 'queue' ? 'Remove from playlist' : 'Delete from history'}
-        >
-          <Trash2 className="h-3 w-3" />
-        </button>
+        {onRemove && (
+          <button
+            type="button"
+            onClick={() => onRemove(itemId)}
+            className="rounded bg-obsidian-800/95 p-1 text-zinc-400 hover:bg-red-500/20 hover:text-red-400"
+            title={tab === 'queue' ? 'Remove from playlist' : 'Delete from history'}
+          >
+            <Trash2 className="h-3 w-3" />
+          </button>
+        )}
       </div>
     </div>
   );
@@ -400,8 +489,11 @@ export default function QueuePanel({
   queue = [],
   history = [],
   activeItemId,
+  currentUser = null,
   isOnline = true,
   sidecarConfigured = false,
+  r2Configured = false,
+  r2Transfer = null,
   fallbackConverterUrl = DEFAULT_FALLBACK_CONVERTER_URL,
   extractingItemId = null,
   localImportProgress = null,
@@ -411,10 +503,14 @@ export default function QueuePanel({
   onCreatePlaylist,
   onRenamePlaylist,
   onDeletePlaylist,
+  onToggleSharePlaylist,
   onSelectVideo,
   onRemoveFromQueue,
   onDeleteHistoryItem,
   onDeleteLocalFile,
+  onUploadToR2,
+  onSaveR2Offline,
+  onDeleteFromR2,
   onMoveQueueItem,
   onReplaceWithLocalFile,
   onFetchViaSidecar,
@@ -588,7 +684,7 @@ export default function QueuePanel({
             >
               {playlists.map((pl) => (
                 <option key={pl.id} value={pl.id} className="bg-obsidian-950 text-zinc-100">
-                  {pl.name} ({pl.items.length})
+                  {pl.isOwner === false ? `[Shared] ${pl.name}` : pl.name} ({pl.items.length})
                 </option>
               ))}
             </select>
@@ -606,30 +702,58 @@ export default function QueuePanel({
               <span className="hidden xl:inline">New</span>
             </button>
 
-            <button
-              type="button"
-              onClick={() => {
-                if (!activePlaylist) return;
-                setPlaylistFormMode('rename');
-                setPlaylistNameDraft(activePlaylist.name);
-              }}
-              title="Rename Playlist"
-              className="shrink-0 rounded-xl border border-zinc-800 bg-obsidian-950 p-2 text-zinc-400 transition hover:border-zinc-700 hover:text-white"
-            >
-              <Pencil className="h-3.5 w-3.5" />
-            </button>
+            {activePlaylist?.isOwner !== false && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => activePlaylist && onToggleSharePlaylist?.(activePlaylist.id)}
+                  title={
+                    activePlaylist?.isSharedWithFriends
+                      ? 'Shared with Friends (click to make private)'
+                      : 'Private Playlist (click to share with friends)'
+                  }
+                  className={`shrink-0 rounded-xl border p-2 transition ${
+                    activePlaylist?.isSharedWithFriends
+                      ? 'border-sky-500/50 bg-sky-500/15 text-sky-300'
+                      : 'border-zinc-800 bg-obsidian-950 text-zinc-400 hover:border-zinc-700 hover:text-white'
+                  }`}
+                >
+                  <Users className="h-3.5 w-3.5" />
+                </button>
 
-            {playlists.length > 1 && (
-              <button
-                type="button"
-                onClick={() => activePlaylist && onDeletePlaylist?.(activePlaylist.id)}
-                title="Delete Playlist"
-                className="shrink-0 rounded-xl border border-zinc-800 bg-obsidian-950 p-2 text-zinc-400 transition hover:border-red-500/40 hover:text-red-400"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-              </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!activePlaylist) return;
+                    setPlaylistFormMode('rename');
+                    setPlaylistNameDraft(activePlaylist.name);
+                  }}
+                  title="Rename Playlist"
+                  className="shrink-0 rounded-xl border border-zinc-800 bg-obsidian-950 p-2 text-zinc-400 transition hover:border-zinc-700 hover:text-white"
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                </button>
+
+                {playlists.filter((p) => p.isOwner !== false).length > 1 && (
+                  <button
+                    type="button"
+                    onClick={() => activePlaylist && onDeletePlaylist?.(activePlaylist.id)}
+                    title="Delete Playlist"
+                    className="shrink-0 rounded-xl border border-zinc-800 bg-obsidian-950 p-2 text-zinc-400 transition hover:border-red-500/40 hover:text-red-400"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </>
             )}
           </div>
+
+          {activePlaylist?.isOwner === false && (
+            <div className="flex items-center gap-1.5 rounded-lg border border-sky-500/25 bg-sky-500/10 px-2.5 py-1 text-[10px] font-semibold text-sky-300">
+              <Users className="h-3 w-3" />
+              <span>Shared by {activePlaylist.ownerName || 'Friend'}</span>
+            </div>
+          )}
 
           {/* Inline Create / Rename Form */}
           {playlistFormMode && (
@@ -816,10 +940,15 @@ export default function QueuePanel({
                     item={item}
                     idx={idx}
                     totalCount={queue.length}
-                    isSortable={true}
+                    isSortable={activePlaylist?.isOwner !== false}
                     isActive={itemId === activeItemId}
                     isOnline={isOnline}
                     sidecarConfigured={sidecarConfigured}
+                    r2Configured={r2Configured}
+                    r2Transfer={r2Transfer}
+                    canManageCloudItem={
+                      activePlaylist?.isOwner !== false || currentUser?.role === 'admin'
+                    }
                     isExpanded={expandedCopyId === itemId}
                     isCopied={copiedId === itemId}
                     isExtracting={
@@ -827,9 +956,12 @@ export default function QueuePanel({
                     }
                     downloadError={batchErrors[itemId] || item.downloadError}
                     onSelectVideo={onSelectVideo}
-                    onMoveQueueItem={onMoveQueueItem}
-                    onRemove={onRemoveFromQueue}
+                    onMoveQueueItem={activePlaylist?.isOwner !== false ? onMoveQueueItem : null}
+                    onRemove={activePlaylist?.isOwner !== false ? onRemoveFromQueue : null}
                     onDeleteLocalFile={onDeleteLocalFile}
+                    onUploadToR2={onUploadToR2}
+                    onSaveR2Offline={onSaveR2Offline}
+                    onDeleteFromR2={onDeleteFromR2}
                     onCopyUrl={handleCopyUrl}
                     onToggleExpand={(id) =>
                       setExpandedCopyId((prev) => (prev === id ? null : id))
@@ -856,6 +988,9 @@ export default function QueuePanel({
                 isActive={itemId === activeItemId}
                 isOnline={isOnline}
                 sidecarConfigured={sidecarConfigured}
+                r2Configured={r2Configured}
+                r2Transfer={r2Transfer}
+                canManageCloudItem={true}
                 isExpanded={expandedCopyId === itemId}
                 isCopied={copiedId === itemId}
                 isExtracting={extractingItemId === itemId}
@@ -864,6 +999,9 @@ export default function QueuePanel({
                 onMoveQueueItem={null}
                 onRemove={onDeleteHistoryItem}
                 onDeleteLocalFile={onDeleteLocalFile}
+                onUploadToR2={onUploadToR2}
+                onSaveR2Offline={onSaveR2Offline}
+                onDeleteFromR2={onDeleteFromR2}
                 onCopyUrl={handleCopyUrl}
                 onToggleExpand={(id) =>
                   setExpandedCopyId((prev) => (prev === id ? null : id))

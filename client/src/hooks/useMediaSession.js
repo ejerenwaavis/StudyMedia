@@ -68,7 +68,7 @@ export function useMediaSession({
   const [lastSignal, setLastSignal] = useState(null);
 
   const isIframeSource = sourceType === 'youtube' || sourceType === 'vimeo';
-  const isNativeSource = sourceType === 'local' || sourceType === 'direct';
+  const isNativeSource = sourceType === 'local' || sourceType === 'direct' || sourceType === 'r2';
 
   // Tap timers for single-tap (±seekInterval) vs double-tap (skip queue item)
   const prevTapTimerRef = useRef(null);
@@ -163,6 +163,8 @@ export function useMediaSession({
     const sourceBadge =
       sourceType === 'local'
         ? 'Offline'
+        : sourceType === 'r2'
+        ? 'Cloud Vault'
         : sourceType === 'vimeo'
         ? 'Vimeo'
         : sourceType === 'direct'
