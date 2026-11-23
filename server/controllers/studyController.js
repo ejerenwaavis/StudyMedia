@@ -29,22 +29,81 @@ function parseLengthTextToSeconds(text) {
 }
 
 /**
- * Walk a parsed YouTube ytInitialData object recursively to gather playlistVideoRenderer entries.
+ * Walk a parsed YouTube ytInitialData object recursively to gather playlist items
+ * across both legacy `playlistVideoRenderer` and current `lockupViewModel` schemas.
  */
-function extractPlaylistRenderers(node, results = []) {
+function extractPlaylistItemsFromData(node, results = [], seen = new Set()) {
   if (!node || typeof node !== 'object') return results;
   if (Array.isArray(node)) {
-    for (const child of node) extractPlaylistRenderers(child, results);
+    for (const child of node) extractPlaylistItemsFromData(child, results, seen);
     return results;
   }
+
   if (node.playlistVideoRenderer && node.playlistVideoRenderer.videoId) {
-    results.push(node.playlistVideoRenderer);
+    const r = node.playlistVideoRenderer;
+    const vid = r.videoId;
+    if (/^[a-zA-Z0-9_-]{11}$/.test(vid) && !seen.has(vid)) {
+      seen.add(vid);
+      results.push({
+        videoId: vid,
+        title:
+          r.title?.runs?.map((run) => run.text).join('') ||
+          r.title?.simpleText ||
+          `Lecture (${vid})`,
+        author: r.shortBylineText?.runs?.map((run) => run.text).join('') || '',
+        duration:
+          Number(r.lengthSeconds) ||
+          parseLengthTextToSeconds(r.lengthText?.simpleText || ''),
+      });
+    }
     return results;
   }
+
+  if (
+    node.lockupViewModel &&
+    typeof node.lockupViewModel.contentId === 'string' &&
+    /^[a-zA-Z0-9_-]{11}$/.test(node.lockupViewModel.contentId)
+  ) {
+    const vm = node.lockupViewModel;
+    const vid = vm.contentId;
+    if (!seen.has(vid)) {
+      seen.add(vid);
+      const title =
+        vm.metadata?.lockupMetadataViewModel?.title?.content || `Lecture (${vid})`;
+      const badgeText =
+        vm.contentImage?.thumbnailViewModel?.overlays?.[0]?.thumbnailOverlayBadgeViewModel
+          ?.thumbnailBadges?.[0]?.thumbnailBadgeViewModel?.text || '';
+      results.push({
+        videoId: vid,
+        title,
+        author: '',
+        duration: parseLengthTextToSeconds(badgeText),
+      });
+    }
+    return results;
+  }
+
   for (const key of Object.keys(node)) {
-    extractPlaylistRenderers(node[key], results);
+    extractPlaylistItemsFromData(node[key], results, seen);
   }
   return results;
+}
+
+function extractYtInitialDataJson(html) {
+  const markers = ['var ytInitialData = ', 'window["ytInitialData"] = '];
+  for (const marker of markers) {
+    const startIdx = html.indexOf(marker);
+    if (startIdx < 0) continue;
+    const jsonStart = startIdx + marker.length;
+    const endIdx = html.indexOf(';</script>', jsonStart);
+    if (endIdx < 0) continue;
+    try {
+      return JSON.parse(html.slice(jsonStart, endIdx));
+    } catch {
+      // try next marker
+    }
+  }
+  return null;
 }
 
 exports.getHealth = (req, res) => {
@@ -112,7 +171,7 @@ exports.getYouTubePlaylist = async (req, res) => {
     return res.status(400).json({ error: 'Invalid or missing YouTube playlist ID' });
   }
 
-  // Tier 1: Parse full playlist page ytInitialData (supports up to 100+ items with durations)
+  // Tier 1: Parse full playlist page ytInitialData (supports 100+ items across legacy & lockupViewModel)
   try {
     const pageUrl = `https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`;
     const htmlRes = await fetch(pageUrl, {
@@ -120,50 +179,30 @@ exports.getYouTubePlaylist = async (req, res) => {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
+        Cookie: 'CONSENT=YES+1',
       },
     });
 
     if (htmlRes.ok) {
       const html = await htmlRes.text();
-      const match =
-        html.match(/var ytInitialData\s*=\s*(\{[\s\S]*?\});\s*<\/script>/) ||
-        html.match(/window\["ytInitialData"\]\s*=\s*(\{[\s\S]*?\});/);
+      const data = extractYtInitialDataJson(html);
 
-      if (match && match[1]) {
-        const data = JSON.parse(match[1]);
+      if (data) {
         const playlistTitle =
           data?.metadata?.playlistMetadataRenderer?.title ||
           data?.header?.playlistHeaderRenderer?.title?.simpleText ||
+          data?.header?.pageHeaderRenderer?.pageTitle ||
           'YouTube Playlist';
 
-        const renderers = extractPlaylistRenderers(data);
-        const seen = new Set();
-        const items = [];
-
-        for (const r of renderers) {
-          const vid = r.videoId;
-          if (!vid || seen.has(vid)) continue;
-          seen.add(vid);
-
-          const title =
-            r.title?.runs?.map((run) => run.text).join('') ||
-            r.title?.simpleText ||
-            `Lecture (${vid})`;
-          const author =
-            r.shortBylineText?.runs?.map((run) => run.text).join('') || '';
-          const durationSec =
-            Number(r.lengthSeconds) ||
-            parseLengthTextToSeconds(r.lengthText?.simpleText || '');
-
-          items.push({
-            videoId: vid,
-            title,
-            author,
-            duration: Number.isFinite(durationSec) ? durationSec : 0,
-            thumbnail: `https://img.youtube.com/vi/${vid}/hqdefault.jpg`,
-            sourceUrl: `https://www.youtube.com/watch?v=${vid}&list=${playlistId}`,
-          });
-        }
+        const extracted = extractPlaylistItemsFromData(data);
+        const items = extracted.map((entry) => ({
+          videoId: entry.videoId,
+          title: entry.title,
+          author: entry.author || '',
+          duration: Number.isFinite(entry.duration) ? entry.duration : 0,
+          thumbnail: `https://img.youtube.com/vi/${entry.videoId}/hqdefault.jpg`,
+          sourceUrl: `https://www.youtube.com/watch?v=${entry.videoId}&list=${playlistId}`,
+        }));
 
         if (items.length > 0) {
           return res.json({

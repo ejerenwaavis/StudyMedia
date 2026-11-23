@@ -301,6 +301,7 @@ export default function App() {
 
   // Invite-only JWT authentication state (hydrated immediately for Airplane Mode support)
   const [auth, setAuth] = useState(() => getSavedAuth());
+  const [authRequired, setAuthRequired] = useState(false);
   const [r2Configured, setR2Configured] = useState(false);
   const [r2Transfer, setR2Transfer] = useState(null); // null | { itemId, type: 'upload'|'download', pct }
   const initialServerSyncDoneRef = useRef(false);
@@ -518,6 +519,24 @@ export default function App() {
     window.addEventListener('beforeinstallprompt', handler);
     return () => window.removeEventListener('beforeinstallprompt', handler);
   }, []);
+
+  // Check server health flags (dbConnected, r2Configured, authConfigured) when online
+  useEffect(() => {
+    if (!isOnline) return;
+    let cancelled = false;
+    fetch('/api/health')
+      .then((r) => r.json())
+      .then((health) => {
+        if (cancelled) return;
+        setDbConnected(Boolean(health?.dbConnected));
+        setR2Configured(Boolean(health?.r2Configured));
+        setAuthRequired(Boolean(health?.authConfigured));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [isOnline]);
 
   // Background JWT verification when online (NEVER blocks offline Airplane Mode entry)
   useEffect(() => {
@@ -1244,7 +1263,7 @@ export default function App() {
   }, []);
 
   // Add or Play any URL (YouTube video, YouTube playlist, Vimeo, or Direct MP4/MP3)
-  const handleAddUrl = async (playImmediately = true) => {
+  const handleAddUrl = async (playImmediately = true, overridePlaylistMode = null) => {
     setUrlError('');
     const detected = detectSourceFromUrl(urlInput);
 
@@ -1255,6 +1274,7 @@ export default function App() {
       return;
     }
 
+    const effectivePlaylistMode = overridePlaylistMode || playlistImportMode;
     const rawUrl = urlInput.trim();
     setUrlInput('');
 
@@ -1288,7 +1308,7 @@ export default function App() {
             })
           );
 
-          if (playlistImportMode === 'new') {
+          if (effectivePlaylistMode === 'new') {
             const now = Date.now();
             const newPlId = `pl_${now}_${Math.random().toString(36).slice(2, 6)}`;
             const newNamedPlaylist = {
@@ -1336,13 +1356,17 @@ export default function App() {
           playlistItems.slice(0, 30).forEach((item) => syncItemToServer(item));
 
           showNotice(
-            playlistImportMode === 'new'
+            effectivePlaylistMode === 'new'
               ? `Created playlist "${ytPlaylistName}" (${playlistItems.length} lectures)`
               : `Appended ${playlistItems.length} lectures to "${activePlaylist.name}"`,
             'success'
           );
           return;
         }
+        showNotice(
+          'Could not expand playlist tracks (it may be private or unlisted) — loaded playlist directly.',
+          'info'
+        );
       } finally {
         setIsAddingUrl(false);
       }
@@ -1790,8 +1814,9 @@ export default function App() {
     onNotify: showNotice,
   };
 
-  // Invite-Only Login Gate (if offline with saved token, auth.token is truthy -> instant offline entry!)
-  if (!auth?.token) {
+  // Invite-Only Login Gate: enforced whenever server has INVITE_CODE + JWT_SECRET configured
+  // (if offline with saved token, auth.token is truthy -> instant offline Airplane Mode entry!)
+  if (authRequired && !auth?.token) {
     return <AuthGate isOnline={isOnline} onAuthenticated={handleAuthenticated} />;
   }
 
@@ -2046,34 +2071,40 @@ export default function App() {
             </div>
           </form>
 
-          {/* Playlist Import Mode Toggle (shown automatically when a YouTube playlist URL is pasted) */}
+          {/* Playlist Quick-Action Bar (clicking either button immediately imports the playlist!) */}
           {urlLooksLikePlaylist && (
             <div className="mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-xs">
               <span className="flex items-center gap-1.5 font-semibold text-amber-300">
                 <ListPlus className="h-3.5 w-3.5" />
                 Playlist link detected:
               </span>
-              <div className="flex items-center gap-1 rounded-lg bg-obsidian-950 p-0.5">
+              <div className="flex flex-wrap items-center gap-1.5">
                 <button
                   type="button"
-                  onClick={() => setPlaylistImportMode('new')}
-                  className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition ${
-                    playlistImportMode === 'new'
-                      ? 'bg-amber-500 text-black'
-                      : 'text-zinc-400 hover:text-white'
-                  }`}
+                  disabled={isAddingUrl}
+                  onClick={() => {
+                    setPlaylistImportMode('new');
+                    handleAddUrl(true, 'new');
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-[11px] font-bold text-black transition hover:bg-amber-400 disabled:opacity-60"
                 >
+                  {isAddingUrl && playlistImportMode === 'new' && (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  )}
                   Create New Named Playlist
                 </button>
                 <button
                   type="button"
-                  onClick={() => setPlaylistImportMode('append')}
-                  className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition ${
-                    playlistImportMode === 'append'
-                      ? 'bg-amber-500 text-black'
-                      : 'text-zinc-400 hover:text-white'
-                  }`}
+                  disabled={isAddingUrl}
+                  onClick={() => {
+                    setPlaylistImportMode('append');
+                    handleAddUrl(false, 'append');
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-obsidian-950 px-3 py-1.5 text-[11px] font-semibold text-zinc-200 transition hover:border-amber-500/50 hover:text-white disabled:opacity-60"
                 >
+                  {isAddingUrl && playlistImportMode === 'append' && (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  )}
                   Append to &ldquo;{activePlaylist.name}&rdquo;
                 </button>
               </div>
