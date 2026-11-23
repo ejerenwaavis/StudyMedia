@@ -348,6 +348,7 @@ export default function App() {
   // Single-item sidecar extraction state
   const [extractingItemId, setExtractingItemId] = useState(null);
   const [extractProgress, setExtractProgress] = useState(null);
+  const [extractError, setExtractError] = useState(null); // null | { itemId, message }
 
   // Sequential offline playlist download state
   const [batchDownload, setBatchDownload] = useState(null);
@@ -1158,8 +1159,24 @@ export default function App() {
       }
 
       setExtractingItemId(targetItem.id);
-      setExtractProgress({ phase: 'extracting', receivedBytes: 0, totalBytes: 0, pct: null });
-      showNotice(`Requesting ${format.toUpperCase()} from Home Sidecar...`, 'info');
+      setExtractError((prev) => (prev?.itemId === targetItem.id ? null : prev));
+      setBatchErrors((prev) => {
+        if (!prev[targetItem.id]) return prev;
+        const next = { ...prev };
+        delete next[targetItem.id];
+        return next;
+      });
+      setExtractProgress({
+        phase: 'Starting yt-dlp...',
+        state: 'queued',
+        percent: 0,
+        pct: null,
+        speed: null,
+        eta: null,
+        receivedBytes: 0,
+        totalBytes: 0,
+      });
+      showNotice(`Starting ${format.toUpperCase()} extraction on Home Sidecar...`, 'info');
       try {
         const result = await extractViaSidecar({
           baseUrl: sidecarUrl,
@@ -1169,10 +1186,27 @@ export default function App() {
           onProgress: (prog) => setExtractProgress(prog),
         });
 
+        setExtractProgress({
+          phase: 'Saving to device...',
+          state: 'saving',
+          percent: 100,
+          pct: 100,
+          speed: null,
+          eta: null,
+          receivedBytes: result.sizeBytes,
+          totalBytes: result.sizeBytes,
+        });
+
         const fileLike = new File([result.blob], result.fileName, { type: result.mimeType });
         await handleReplaceWithLocalFile(targetItem, fileLike);
+        setTimeout(() => {
+          playerRef.current?.play?.();
+        }, 250);
       } catch (err) {
-        showNotice(err?.message || 'Sidecar extraction failed.', 'error');
+        const message = err?.message || 'Sidecar extraction failed.';
+        setExtractError({ itemId: targetItem.id, message });
+        setBatchErrors((prev) => ({ ...prev, [targetItem.id]: message }));
+        showNotice(message, 'error');
       } finally {
         setExtractingItemId(null);
         setExtractProgress(null);
@@ -2133,6 +2167,7 @@ export default function App() {
                   fallbackConverterUrl={fallbackConverterUrl}
                   extractingItemId={extractingItemId}
                   extractProgress={extractProgress}
+                  extractError={extractError?.itemId === activeItem?.id ? extractError.message : null}
                   hasPrevTrack={hasPrevTrack}
                   hasNextTrack={hasNextTrack}
                   onStateChange={handlePlayerStateChange}
@@ -2181,6 +2216,7 @@ export default function App() {
                     fallbackConverterUrl={fallbackConverterUrl}
                     extractingItemId={extractingItemId}
                     extractProgress={extractProgress}
+                    extractError={extractError?.itemId === activeItem?.id ? extractError.message : null}
                     hasPrevTrack={hasPrevTrack}
                     hasNextTrack={hasNextTrack}
                     onStateChange={handlePlayerStateChange}
@@ -2384,6 +2420,7 @@ export default function App() {
                     fallbackConverterUrl={fallbackConverterUrl}
                     extractingItemId={extractingItemId}
                     extractProgress={extractProgress}
+                    extractError={extractError?.itemId === activeItem?.id ? extractError.message : null}
                     hasPrevTrack={hasPrevTrack}
                     hasNextTrack={hasNextTrack}
                     onStateChange={handlePlayerStateChange}

@@ -4,6 +4,17 @@
 $ErrorActionPreference = 'Continue'
 Set-Location $PSScriptRoot
 
+$pidFile = Join-Path $PSScriptRoot 'watchdog.pid'
+
+# Stop any previous watchdog instance recorded in watchdog.pid
+if (Test-Path $pidFile) {
+  $oldPid = (Get-Content $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+  if ($oldPid -and ($oldPid -as [int]) -and ([int]$oldPid -ne $PID)) {
+    Stop-Process -Id ([int]$oldPid) -Force -ErrorAction SilentlyContinue
+  }
+}
+Set-Content -Path $pidFile -Value $PID -Encoding ascii
+
 # Refresh PATH so yt-dlp and ffmpeg installed via winget are always found
 $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
 
@@ -16,17 +27,25 @@ $logFile = Join-Path $PSScriptRoot 'sidecar.log'
 
 while ($true) {
   $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-  Add-Content -Path $logFile -Value "[$ts] Starting StudyMedia Sidecar on 127.0.0.1:4848..."
+  try {
+    Add-Content -Path $logFile -Encoding utf8 -Value "[$ts] Starting StudyMedia Sidecar on 127.0.0.1:4848..."
+    # Trim log file if larger than 2 MB
+    if ((Test-Path $logFile) -and ((Get-Item $logFile).Length -gt 2MB)) {
+      Get-Content $logFile -Tail 200 | Set-Content -Encoding utf8 $logFile
+    }
+  } catch {
+    # Ignore transient log lock
+  }
 
-  # Trim log file if larger than 2 MB
-  if ((Test-Path $logFile) -and ((Get-Item $logFile).Length -gt 2MB)) {
-    Get-Content $logFile -Tail 200 | Set-Content $logFile
+  # Clean up any orphaned process still holding port 4848 before starting
+  Get-NetTCPConnection -LocalPort 4848 -ErrorAction SilentlyContinue | ForEach-Object {
+    Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
   }
 
   try {
-    & node server.js *>> $logFile
+    & node server.js 2>&1 | Out-File -FilePath $logFile -Encoding utf8 -Append
   } catch {
-    Add-Content -Path $logFile -Value "[$ts] Process error: $_"
+    try { Add-Content -Path $logFile -Encoding utf8 -Value "[$ts] Process error: $_" } catch {}
   }
 
   Start-Sleep -Seconds 3

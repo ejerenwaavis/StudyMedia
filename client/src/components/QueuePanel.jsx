@@ -876,8 +876,10 @@ export default function QueuePanel({
                   <span className="truncate">
                     {batchDownload.status === 'paused'
                       ? `Paused • ${batchDownload.completed} of ${batchDownload.total}`
-                      : `Downloading ${batchDownload.currentIndex} of ${batchDownload.total}${
-                          batchDownload.itemPct != null ? ` • ${batchDownload.itemPct}%` : ''
+                      : `${batchDownload.currentIndex}/${batchDownload.total} • ${
+                          batchDownload.phase || 'Downloading...'
+                        }${batchDownload.itemPct != null ? ` ${batchDownload.itemPct}%` : ''}${
+                          batchDownload.speed ? ` • ${batchDownload.speed}` : ''
                         }`}
                   </span>
                 </span>

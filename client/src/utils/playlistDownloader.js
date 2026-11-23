@@ -151,7 +151,9 @@ export class SequentialPlaylistDownloader {
                 activeItemTitle: item.title,
                 itemPct: prog?.pct ?? null,
                 receivedBytes: prog?.receivedBytes || 0,
-                phase: prog?.phase || 'downloading',
+                phase: prog?.phase || 'Downloading...',
+                speed: prog?.speed || null,
+                eta: prog?.eta || null,
                 format,
               });
             },

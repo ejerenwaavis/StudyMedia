@@ -57,6 +57,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     fallbackConverterUrl = DEFAULT_FALLBACK_CONVERTER_URL,
     extractingItemId = null,
     extractProgress = null,
+    extractError = null,
     hasPrevTrack = false,
     hasNextTrack = false,
     onStateChange,
@@ -707,15 +708,15 @@ const VideoPlayer = forwardRef(function VideoPlayer(
           )}
 
           {isExtracting && (
-            <div className="mt-3 w-full max-w-sm rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-3 text-left">
-              <div className="mb-1.5 flex items-center justify-between text-[11px] font-semibold text-emerald-300">
-                <span className="flex items-center gap-1.5">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  {extractProgress?.phase === 'downloading'
-                    ? 'Downloading to IndexedDB...'
-                    : 'Extracting on Home Sidecar...'}
+            <div className="mt-3 w-full max-w-md rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-3 text-left">
+              <div className="mb-1.5 flex items-center justify-between gap-2 text-[11px] font-semibold text-emerald-300">
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                  <span className="truncate">
+                    {extractProgress?.phase || 'Extracting on Home Sidecar...'}
+                  </span>
                 </span>
-                <span className="font-mono">
+                <span className="shrink-0 font-mono">
                   {extractProgress?.pct != null
                     ? `${extractProgress.pct}%`
                     : extractProgress?.receivedBytes
@@ -725,13 +726,49 @@ const VideoPlayer = forwardRef(function VideoPlayer(
               </div>
               <div className="h-1.5 w-full overflow-hidden rounded-full bg-obsidian-950">
                 <div
-                  className={`h-full rounded-full bg-emerald-400 transition-all duration-200 ${
-                    extractProgress?.pct == null ? 'w-1/2 animate-pulse' : ''
+                  className={`h-full rounded-full bg-emerald-400 transition-all duration-300 ${
+                    extractProgress?.pct == null ||
+                    (extractProgress?.state === 'queued' && extractProgress?.pct === 0)
+                      ? 'w-1/3 animate-pulse'
+                      : ''
                   }`}
                   style={
-                    extractProgress?.pct != null ? { width: `${extractProgress.pct}%` } : undefined
+                    extractProgress?.pct != null &&
+                    !(extractProgress?.state === 'queued' && extractProgress?.pct === 0)
+                      ? { width: `${Math.max(3, extractProgress.pct)}%` }
+                      : undefined
                   }
                 />
+              </div>
+              {(extractProgress?.speed ||
+                extractProgress?.eta ||
+                (extractProgress?.state === 'saving' && extractProgress?.totalBytes > 0)) && (
+                <div className="mt-1.5 flex items-center justify-between font-mono text-[10px] text-emerald-200/80">
+                  <span>
+                    {extractProgress?.speed
+                      ? `${extractProgress.speed}`
+                      : extractProgress?.state === 'saving' && extractProgress?.totalBytes > 0
+                      ? `${formatBytes(extractProgress.receivedBytes)} / ${formatBytes(
+                          extractProgress.totalBytes
+                        )}`
+                      : ''}
+                  </span>
+                  <span>{extractProgress?.eta ? `ETA ${extractProgress.eta}` : ''}</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {!isExtracting && extractError && (
+            <div className="mt-3 w-full max-w-md rounded-xl border border-red-500/40 bg-red-500/10 px-3.5 py-2.5 text-left text-xs text-red-200">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
+                <div className="min-w-0 flex-1">
+                  <p className="font-semibold text-red-300">Sidecar Extraction Error</p>
+                  <p className="mt-0.5 break-words text-[11px] leading-relaxed text-red-200/90">
+                    {extractError}
+                  </p>
+                </div>
               </div>
             </div>
           )}
