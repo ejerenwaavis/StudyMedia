@@ -1821,7 +1821,7 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-obsidian-950 text-zinc-100">
+    <div className="min-h-screen bg-obsidian-950 text-zinc-100 lg:flex lg:h-[100dvh] lg:flex-col lg:overflow-hidden">
       {/* Hidden multi-file local media picker */}
       <input
         ref={localFileInputRef}
@@ -1855,8 +1855,8 @@ export default function App() {
       )}
 
       {/* Top Header */}
-      <header className="sticky top-0 z-30 border-b border-zinc-800/80 bg-obsidian-950/90 backdrop-blur-md">
-        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-3">
+      <header className="sticky top-0 z-30 shrink-0 border-b border-zinc-800/80 bg-obsidian-950/90 backdrop-blur-md">
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-2.5 px-4 py-2.5">
           {/* Brand */}
           <div className="flex items-center gap-3">
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-500/15 ring-1 ring-amber-500/40">
@@ -2005,9 +2005,9 @@ export default function App() {
       </header>
 
       {/* Main Content */}
-      <main className="mx-auto max-w-7xl px-4 py-5">
+      <main className="mx-auto w-full max-w-7xl px-4 py-3 lg:flex lg:min-h-0 lg:flex-1 lg:flex-col lg:overflow-hidden">
         {/* Universal Source URL Bar + Multi-File Import Local Media */}
-        <div className="mb-5">
+        <div className="mb-3 shrink-0">
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -2025,14 +2025,14 @@ export default function App() {
                   if (urlError) setUrlError('');
                 }}
                 placeholder="Paste YouTube, playlist, Vimeo, or direct MP4/MP3 URL..."
-                className="w-full rounded-xl border border-zinc-800 bg-obsidian-900 py-3 pl-10 pr-4 text-sm text-white placeholder-zinc-500 transition focus:border-amber-500/70 focus:outline-none"
+                className="w-full rounded-xl border border-zinc-800 bg-obsidian-900 py-2.5 pl-10 pr-4 text-sm text-white placeholder-zinc-500 transition focus:border-amber-500/70 focus:outline-none"
               />
             </div>
             <div className="flex flex-wrap gap-2">
               <button
                 type="submit"
                 disabled={isAddingUrl}
-                className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 py-3 text-sm font-bold text-black transition hover:bg-amber-400 disabled:opacity-60 sm:flex-initial"
+                className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 py-2.5 text-sm font-bold text-black transition hover:bg-amber-400 disabled:opacity-60 sm:flex-initial"
               >
                 {isAddingUrl ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -2045,7 +2045,7 @@ export default function App() {
                 type="button"
                 disabled={isAddingUrl}
                 onClick={() => handleAddUrl(false)}
-                className="flex items-center justify-center gap-1.5 rounded-xl border border-zinc-800 bg-obsidian-900 px-4 py-3 text-sm font-semibold text-zinc-200 transition hover:border-zinc-700 hover:bg-obsidian-800 disabled:opacity-60"
+                className="flex items-center justify-center gap-1.5 rounded-xl border border-zinc-800 bg-obsidian-900 px-4 py-2.5 text-sm font-semibold text-zinc-200 transition hover:border-zinc-700 hover:bg-obsidian-800 disabled:opacity-60"
               >
                 <Plus className="h-4 w-4" />
                 Queue
@@ -2055,7 +2055,7 @@ export default function App() {
                 disabled={isImportingLocal}
                 onClick={() => localFileInputRef.current?.click()}
                 title="Import one or multiple local MP4, WebM, MP3, or M4A files for offline study"
-                className="flex items-center justify-center gap-1.5 rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-4 py-3 text-sm font-semibold text-emerald-300 transition hover:border-emerald-500/60 hover:bg-emerald-500/20 disabled:opacity-60"
+                className="flex items-center justify-center gap-1.5 rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-4 py-2.5 text-sm font-semibold text-emerald-300 transition hover:border-emerald-500/60 hover:bg-emerald-500/20 disabled:opacity-60"
               >
                 {isImportingLocal ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -2116,53 +2116,8 @@ export default function App() {
 
         {/* Theater Mode Layout */}
         {mode === 'theater' && (
-          <div className="space-y-4">
-            {activeItem ? (
-              <VideoPlayer
-                ref={playerRef}
-                source={activeItem}
-                initialTime={activeItem.lastPosition || 0}
-                playbackSpeed={playbackSpeed}
-                seekInterval={seekInterval}
-                audioOnlyMode={audioOnlyMode}
-                theaterMode={true}
-                isOnline={isOnline}
-                sidecarUrl={sidecarUrl}
-                sidecarApiKey={sidecarApiKey}
-                fallbackConverterUrl={fallbackConverterUrl}
-                extractingItemId={extractingItemId}
-                extractProgress={extractProgress}
-                hasPrevTrack={hasPrevTrack}
-                hasNextTrack={hasNextTrack}
-                onStateChange={handlePlayerStateChange}
-                onEnded={handleAutoAdvance}
-                onPrevTrack={handlePrevTrack}
-                onNextTrack={handleNextTrack}
-                onChangeSpeed={handleSelectSpeed}
-                onTimeUpdate={(cur, dur) => {
-                  setCurrentTime(cur);
-                  if (dur > 0) setDuration(dur);
-                }}
-                onProgressSave={handleProgressSave}
-                onExitTheater={() => handleModeChange('study')}
-                onReplaceWithLocalFile={handleReplaceWithLocalFile}
-                onFetchViaSidecar={handleFetchViaSidecar}
-                onNotify={showNotice}
-              />
-            ) : (
-              <EmptyPlayerCard onImportClick={() => localFileInputRef.current?.click()} />
-            )}
-            <p className="text-center text-xs text-zinc-500">
-              Theater mode: controls fade out after 3 seconds • Move mouse or tap to reveal
-            </p>
-          </div>
-        )}
-
-        {/* Study Mode Layout */}
-        {mode === 'study' && (
-          <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
-            {/* Left / Main Stage */}
-            <div className="space-y-4 lg:col-span-8 xl:col-span-9">
+          <div className="flex flex-col gap-2 lg:min-h-0 lg:flex-1">
+            <div className="w-full lg:min-h-0 lg:flex-1">
               {activeItem ? (
                 <VideoPlayer
                   ref={playerRef}
@@ -2171,7 +2126,7 @@ export default function App() {
                   playbackSpeed={playbackSpeed}
                   seekInterval={seekInterval}
                   audioOnlyMode={audioOnlyMode}
-                  theaterMode={false}
+                  theaterMode={true}
                   isOnline={isOnline}
                   sidecarUrl={sidecarUrl}
                   sidecarApiKey={sidecarApiKey}
@@ -2190,6 +2145,7 @@ export default function App() {
                     if (dur > 0) setDuration(dur);
                   }}
                   onProgressSave={handleProgressSave}
+                  onExitTheater={() => handleModeChange('study')}
                   onReplaceWithLocalFile={handleReplaceWithLocalFile}
                   onFetchViaSidecar={handleFetchViaSidecar}
                   onNotify={showNotice}
@@ -2197,9 +2153,57 @@ export default function App() {
               ) : (
                 <EmptyPlayerCard onImportClick={() => localFileInputRef.current?.click()} />
               )}
+            </div>
+            <p className="shrink-0 text-center text-xs text-zinc-500">
+              Theater mode: controls fade out after 3 seconds • Move mouse or tap to reveal
+            </p>
+          </div>
+        )}
+
+        {/* Study Mode Layout */}
+        {mode === 'study' && (
+          <div className="grid grid-cols-1 gap-4 lg:min-h-0 lg:flex-1 lg:grid-cols-12 lg:overflow-hidden">
+            {/* Left / Main Stage */}
+            <div className="flex flex-col gap-3 lg:col-span-8 lg:h-full lg:min-h-0 xl:col-span-8">
+              <div className="w-full lg:min-h-0 lg:flex-1">
+                {activeItem ? (
+                  <VideoPlayer
+                    ref={playerRef}
+                    source={activeItem}
+                    initialTime={activeItem.lastPosition || 0}
+                    playbackSpeed={playbackSpeed}
+                    seekInterval={seekInterval}
+                    audioOnlyMode={audioOnlyMode}
+                    theaterMode={false}
+                    isOnline={isOnline}
+                    sidecarUrl={sidecarUrl}
+                    sidecarApiKey={sidecarApiKey}
+                    fallbackConverterUrl={fallbackConverterUrl}
+                    extractingItemId={extractingItemId}
+                    extractProgress={extractProgress}
+                    hasPrevTrack={hasPrevTrack}
+                    hasNextTrack={hasNextTrack}
+                    onStateChange={handlePlayerStateChange}
+                    onEnded={handleAutoAdvance}
+                    onPrevTrack={handlePrevTrack}
+                    onNextTrack={handleNextTrack}
+                    onChangeSpeed={handleSelectSpeed}
+                    onTimeUpdate={(cur, dur) => {
+                      setCurrentTime(cur);
+                      if (dur > 0) setDuration(dur);
+                    }}
+                    onProgressSave={handleProgressSave}
+                    onReplaceWithLocalFile={handleReplaceWithLocalFile}
+                    onFetchViaSidecar={handleFetchViaSidecar}
+                    onNotify={showNotice}
+                  />
+                ) : (
+                  <EmptyPlayerCard onImportClick={() => localFileInputRef.current?.click()} />
+                )}
+              </div>
 
               {/* Progress Scrubber & Timestamps */}
-              <div className="rounded-2xl border border-zinc-800/80 bg-obsidian-900 p-4">
+              <div className="shrink-0 rounded-2xl border border-zinc-800/80 bg-obsidian-900 p-3.5">
                 <div className="mb-2 flex items-center justify-between gap-2">
                   <div className="flex min-w-0 items-center gap-2">
                     <p className="truncate text-sm font-semibold text-zinc-100">
@@ -2331,7 +2335,7 @@ export default function App() {
             </div>
 
             {/* Right Sidebar: Named Playlists & History */}
-            <div className="lg:col-span-4 xl:col-span-3">
+            <div className="lg:col-span-4 lg:h-full lg:min-h-0 xl:col-span-4">
               <QueuePanel {...sharedQueueProps} />
             </div>
           </div>
@@ -2339,8 +2343,8 @@ export default function App() {
 
         {/* Car Mode Layout */}
         {mode === 'car' && (
-          <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
-            <div className="space-y-4 lg:col-span-8">
+          <div className="grid grid-cols-1 gap-4 lg:min-h-0 lg:flex-1 lg:grid-cols-12 lg:overflow-hidden">
+            <div className="space-y-3 lg:col-span-8 lg:h-full lg:min-h-0 lg:overflow-y-auto lg:pr-1">
               <CarControlDeck
                 title={activeItem?.title}
                 isPlaying={isPlaying}
@@ -2365,7 +2369,7 @@ export default function App() {
 
               {/* Keep Unified Player mounted in Car Mode (Audio-Only friendly) */}
               {activeItem && (
-                <div className="overflow-hidden rounded-2xl">
+                <div className="h-44 overflow-hidden rounded-2xl">
                   <VideoPlayer
                     ref={playerRef}
                     source={activeItem}
@@ -2400,7 +2404,7 @@ export default function App() {
               )}
             </div>
 
-            <div className="lg:col-span-4">
+            <div className="lg:col-span-4 lg:h-full lg:min-h-0">
               <QueuePanel {...sharedQueueProps} />
             </div>
           </div>
@@ -2480,7 +2484,7 @@ export default function App() {
 
 function EmptyPlayerCard({ onImportClick }) {
   return (
-    <div className="flex aspect-video w-full flex-col items-center justify-center rounded-2xl border border-dashed border-zinc-800 bg-obsidian-900/60 p-8 text-center">
+    <div className="flex aspect-video w-full flex-col items-center justify-center rounded-2xl border border-dashed border-zinc-800 bg-obsidian-900/60 p-8 text-center lg:aspect-auto lg:h-full">
       <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-amber-500/10 ring-1 ring-amber-500/30">
         <Play className="ml-1 h-7 w-7 text-amber-400" />
       </div>

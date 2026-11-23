@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   DndContext,
   closestCenter,
@@ -45,16 +45,30 @@ import {
   Cloud,
   CloudOff,
   Users,
+  LayoutList,
+  Image as ImageIcon,
 } from 'lucide-react';
 import { formatTime } from '../utils/youtube';
 import { formatBytes } from '../storage/mediaDB';
 import { getExternalUrl, isAudioItem, TRUSTED_DOWNLOADERS } from '../utils/sourceDetector';
 import { buildConverterUrl, DEFAULT_FALLBACK_CONVERTER_URL } from '../utils/sidecarClient';
 
+const VIEW_MODE_KEY = 'studymedia_queue_view_v1';
+
+function loadSavedViewMode() {
+  try {
+    const val = localStorage.getItem(VIEW_MODE_KEY);
+    return val === 'thumbnails' || val === 'details' ? val : 'details';
+  } catch {
+    return 'details';
+  }
+}
+
 function SortableQueueCard({
   item,
   idx,
   totalCount,
+  viewMode,
   isSortable,
   isActive,
   isOnline,
@@ -99,6 +113,7 @@ function SortableQueueCard({
   const offlineLocked = !isOnline && !item.isOfflineReady;
   const externalUrl = getExternalUrl(item);
   const audioOnly = isAudioItem(item);
+  const isDetailsView = viewMode === 'details';
   const pct =
     item.duration > 0
       ? Math.min(100, Math.round((item.lastPosition / item.duration) * 100))
@@ -109,7 +124,7 @@ function SortableQueueCard({
       ref={setNodeRef}
       style={style}
       onClick={() => onSelectVideo(item)}
-      className={`group relative cursor-pointer rounded-xl border p-2 transition-colors ${
+      className={`group relative cursor-pointer rounded-xl border p-2.5 transition-colors ${
         isDragging
           ? 'border-amber-400 bg-obsidian-800 shadow-2xl ring-1 ring-amber-400/50'
           : isActive
@@ -128,74 +143,99 @@ function SortableQueueCard({
             style={{ touchAction: 'none' }}
             title="Drag to reorder"
             aria-label="Drag to reorder lecture"
-            className="mt-1 flex h-12 w-5 shrink-0 cursor-grab items-center justify-center rounded-md text-zinc-600 transition hover:bg-obsidian-800 hover:text-zinc-300 active:cursor-grabbing active:text-amber-400"
+            className="mt-0.5 flex h-8 w-5 shrink-0 cursor-grab items-center justify-center rounded-md text-zinc-600 transition hover:bg-obsidian-800 hover:text-zinc-300 active:cursor-grabbing active:text-amber-400"
           >
-            <GripVertical className="h-4 w-4" />
+            <GripVertical className="h-3.5 w-3.5" />
           </button>
         )}
 
-        {/* Thumbnail */}
-        <div className="relative flex h-14 w-20 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-obsidian-800 sm:w-24">
-          {item.thumbnail ? (
-            <img
-              src={item.thumbnail}
-              alt={item.title}
-              className="h-full w-full object-cover"
-              loading="lazy"
-            />
-          ) : audioOnly ? (
-            <Music className="h-5 w-5 text-amber-400/80" />
-          ) : (
-            <Film className="h-5 w-5 text-zinc-500" />
-          )}
-
-          {isActive && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/45">
-              <Play className="h-4 w-4 fill-amber-400 text-amber-400" />
-            </div>
-          )}
-
-          {isExtracting && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/65">
-              <Loader2 className="h-4 w-4 animate-spin text-emerald-400" />
-            </div>
-          )}
-
-          {item.lastPosition > 0 && (
-            <span className="absolute bottom-1 right-1 rounded bg-black/80 px-1 py-0.5 font-mono text-[10px] font-medium text-zinc-200">
-              {formatTime(item.lastPosition)}
-            </span>
-          )}
-        </div>
-
-        {/* Metadata */}
-        <div className="flex min-w-0 flex-1 flex-col justify-between py-0.5">
-          <p
-            className={`line-clamp-2 pr-14 text-xs font-semibold leading-snug ${
-              isActive ? 'text-amber-300' : 'text-zinc-200'
+        {/* Details View: Compact Track Number / Play Badge (gives 100% width to long titles!) */}
+        {isDetailsView ? (
+          <div
+            className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg font-mono text-[11px] font-bold ${
+              isActive
+                ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-500/40'
+                : 'bg-obsidian-800/90 text-zinc-400'
             }`}
+          >
+            {isExtracting ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-400" />
+            ) : isActive ? (
+              <Play className="h-3.5 w-3.5 fill-amber-400 text-amber-400" />
+            ) : (
+              String(idx + 1).padStart(2, '0')
+            )}
+          </div>
+        ) : (
+          /* Thumbnails View: Sleek 16:9 Thumbnail */
+          <div className="relative flex h-12 w-20 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-obsidian-800">
+            {item.thumbnail ? (
+              <img
+                src={item.thumbnail}
+                alt={item.title}
+                className="h-full w-full object-cover"
+                loading="lazy"
+              />
+            ) : audioOnly ? (
+              <Music className="h-4 w-4 text-amber-400/80" />
+            ) : (
+              <Film className="h-4 w-4 text-zinc-500" />
+            )}
+
+            {isActive && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/45">
+                <Play className="h-3.5 w-3.5 fill-amber-400 text-amber-400" />
+              </div>
+            )}
+
+            {isExtracting && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/65">
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-400" />
+              </div>
+            )}
+
+            {item.lastPosition > 0 && (
+              <span className="absolute bottom-0.5 right-0.5 rounded bg-black/80 px-1 py-0.5 font-mono text-[9px] font-medium text-zinc-200">
+                {formatTime(item.lastPosition)}
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Full-Width Readable Title & Metadata */}
+        <div className="min-w-0 flex-1">
+          <p
+            title={item.title || `Lecture (${itemId})`}
+            className={`break-words text-xs font-semibold leading-snug ${
+              isDetailsView ? 'line-clamp-3' : 'line-clamp-2'
+            } ${isActive ? 'text-amber-300' : 'text-zinc-100'}`}
           >
             {item.title || `Lecture (${itemId})`}
           </p>
 
           <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-zinc-500">
-            <span className="flex items-center gap-1">
-              <Clock className="h-3 w-3" />
-              {item.duration > 0 ? `${pct}% • ${formatTime(item.duration)}` : 'Ready'}
+            <span className="flex items-center gap-1 font-mono">
+              <Clock className="h-2.5 w-2.5" />
+              {item.duration > 0
+                ? `${item.lastPosition > 0 ? `${formatTime(item.lastPosition)} / ` : ''}${formatTime(
+                    item.duration
+                  )}`
+                : item.lastPosition > 0
+                ? formatTime(item.lastPosition)
+                : 'Ready'}
             </span>
 
             {item.isOfflineReady && (
               <span className="inline-flex items-center gap-0.5 rounded bg-emerald-500/15 px-1.5 py-0.5 font-semibold text-emerald-400">
                 <HardDrive className="h-2.5 w-2.5" />
-                Offline Ready
-                {item.sizeBytes ? ` • ${formatBytes(item.sizeBytes)}` : ''}
+                Offline{item.sizeBytes ? ` • ${formatBytes(item.sizeBytes)}` : ''}
               </span>
             )}
 
             {item.r2Key && (
               <span className="inline-flex items-center gap-0.5 rounded bg-sky-500/15 px-1.5 py-0.5 font-semibold text-sky-300">
                 <Cloud className="h-2.5 w-2.5" />
-                Cloud Vault
+                Vault
               </span>
             )}
 
@@ -238,63 +278,178 @@ function SortableQueueCard({
         </div>
       )}
 
-      {/* Quick Local Copy / Downloader Utility Row for Online Items */}
-      {!item.isOfflineReady && externalUrl && (
-        <div
-          onClick={(e) => e.stopPropagation()}
-          className="mt-2 flex flex-wrap items-center gap-1.5 border-t border-zinc-800/60 pt-1.5"
-        >
-          <button
-            type="button"
-            onClick={(e) => onCopyUrl(e, item)}
-            className="inline-flex items-center gap-1 rounded-md bg-obsidian-800/90 px-2 py-0.5 text-[10px] font-medium text-zinc-300 transition hover:bg-obsidian-700 hover:text-white"
-            title="Copy lecture URL"
-          >
-            {isCopied ? (
-              <>
-                <Check className="h-2.5 w-2.5 text-emerald-400" />
-                <span className="text-emerald-400">Copied</span>
-              </>
-            ) : (
-              <>
-                <Copy className="h-2.5 w-2.5" />
-                Copy URL
-              </>
-            )}
-          </button>
+      {/* Compact Non-Overlapping Footer Action Row (Online Copy/Sidecar, Cloud Vault, & Reorder/Delete) */}
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="mt-2 flex flex-wrap items-center justify-between gap-1.5 border-t border-zinc-800/60 pt-1.5"
+      >
+        <div className="flex flex-wrap items-center gap-1">
+          {/* Online item actions */}
+          {!item.isOfflineReady && externalUrl && (
+            <>
+              <button
+                type="button"
+                onClick={(e) => onCopyUrl(e, item)}
+                className="inline-flex items-center gap-1 rounded-md bg-obsidian-800/90 px-1.5 py-0.5 text-[10px] font-medium text-zinc-300 transition hover:bg-obsidian-700 hover:text-white"
+                title="Copy lecture URL"
+              >
+                {isCopied ? (
+                  <>
+                    <Check className="h-2.5 w-2.5 text-emerald-400" />
+                    <span className="text-emerald-400">Copied</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="h-2.5 w-2.5" />
+                    URL
+                  </>
+                )}
+              </button>
 
-          <button
-            type="button"
-            onClick={() => onToggleExpand(itemId)}
-            className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[10px] font-medium transition ${
-              isExpanded
-                ? 'bg-amber-500/20 text-amber-300'
-                : 'bg-obsidian-800/90 text-zinc-300 hover:bg-obsidian-700 hover:text-white'
-            }`}
-            title="Download & import local offline copy"
-          >
-            <Download className="h-2.5 w-2.5" />
-            Local Copy
-          </button>
+              <button
+                type="button"
+                onClick={() => onToggleExpand(itemId)}
+                className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-medium transition ${
+                  isExpanded
+                    ? 'bg-amber-500/20 text-amber-300'
+                    : 'bg-obsidian-800/90 text-zinc-300 hover:bg-obsidian-700 hover:text-white'
+                }`}
+                title="Download & import local offline copy"
+              >
+                <Download className="h-2.5 w-2.5" />
+                Local
+              </button>
 
-          {sidecarConfigured && item.sourceType === 'youtube' && (
+              {sidecarConfigured && item.sourceType === 'youtube' && (
+                <button
+                  type="button"
+                  disabled={isExtracting}
+                  onClick={() => onFetchViaSidecar?.(item, 'mp4')}
+                  className="inline-flex items-center gap-1 rounded-md bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300 transition hover:bg-emerald-500/25 disabled:opacity-60"
+                  title="Extract via Home Sidecar directly to IndexedDB"
+                >
+                  {isExtracting ? (
+                    <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                  ) : (
+                    <Server className="h-2.5 w-2.5" />
+                  )}
+                  {isExtracting ? 'Fetching...' : 'Sidecar'}
+                </button>
+              )}
+            </>
+          )}
+
+          {/* Local item NOT yet in Cloud Vault -> Save to Cloud Vault */}
+          {item.isOfflineReady && !item.r2Key && onUploadToR2 && (
             <button
               type="button"
-              disabled={isExtracting}
-              onClick={() => onFetchViaSidecar?.(item, 'mp4')}
-              className="inline-flex items-center gap-1 rounded-md bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-300 transition hover:bg-emerald-500/25 disabled:opacity-60"
-              title="Extract via Home Sidecar directly to IndexedDB"
+              disabled={!isOnline || !r2Configured || Boolean(r2Transfer)}
+              onClick={() => onUploadToR2(item)}
+              title={
+                r2Configured
+                  ? 'Upload to Cloudflare R2 Cloud Vault for cross-device streaming & sharing'
+                  : 'Configure Cloudflare R2 credentials on server to enable Cloud Vault'
+              }
+              className="inline-flex items-center gap-1 rounded-md bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-sky-300 transition hover:bg-sky-500/25 disabled:cursor-not-allowed disabled:opacity-45"
             >
-              {isExtracting ? (
-                <Loader2 className="h-2.5 w-2.5 animate-spin" />
+              {r2Transfer?.itemId === itemId && r2Transfer.type === 'upload' ? (
+                <>
+                  <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                  {r2Transfer.pct ?? 0}%
+                </>
               ) : (
-                <Server className="h-2.5 w-2.5" />
+                <>
+                  <CloudUpload className="h-2.5 w-2.5" />
+                  Save to Cloud
+                </>
               )}
-              {isExtracting ? 'Fetching...' : 'Sidecar'}
+            </button>
+          )}
+
+          {/* Cloud Vault item NOT yet in local IndexedDB -> Save Offline */}
+          {item.r2Key && !item.isOfflineReady && onSaveR2Offline && (
+            <button
+              type="button"
+              disabled={!isOnline || Boolean(r2Transfer)}
+              onClick={() => onSaveR2Offline(item)}
+              title="Download from Cloud Vault into local IndexedDB (0 R2 requests on future plays)"
+              className="inline-flex items-center gap-1 rounded-md bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300 transition hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              {r2Transfer?.itemId === itemId && r2Transfer.type === 'download' ? (
+                <>
+                  <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                  {r2Transfer.pct != null ? `${r2Transfer.pct}%` : '...'}
+                </>
+              ) : (
+                <>
+                  <CloudDownload className="h-2.5 w-2.5" />
+                  Save Offline
+                </>
+              )}
+            </button>
+          )}
+
+          {item.r2Key && canManageCloudItem && onDeleteFromR2 && (
+            <button
+              type="button"
+              disabled={!isOnline || Boolean(r2Transfer)}
+              onClick={() => onDeleteFromR2(item)}
+              className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-medium text-zinc-400 transition hover:bg-red-500/15 hover:text-red-400 disabled:opacity-40"
+              title="Delete video from Cloudflare R2 Cloud Vault"
+            >
+              <CloudOff className="h-2.5 w-2.5" />
+            </button>
+          )}
+
+          {item.isOfflineReady && onDeleteLocalFile && (
+            <button
+              type="button"
+              onClick={() => onDeleteLocalFile(item)}
+              className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-medium text-zinc-400 transition hover:bg-red-500/15 hover:text-red-400"
+              title="Delete local blob from IndexedDB to free device storage"
+            >
+              <FolderX className="h-2.5 w-2.5" />
+              Free Local
             </button>
           )}
         </div>
-      )}
+
+        {/* One-Thumb Move Up / Down & Remove Controls (never overlaps title!) */}
+        <div className="flex items-center gap-0.5">
+          {tab === 'queue' && onMoveQueueItem && (
+            <>
+              <button
+                type="button"
+                disabled={idx === 0}
+                onClick={() => onMoveQueueItem(idx, idx - 1)}
+                className="rounded p-1 text-zinc-500 transition hover:bg-obsidian-800 hover:text-white disabled:opacity-25"
+                title="Move up"
+              >
+                <ChevronUp className="h-3 w-3" />
+              </button>
+              <button
+                type="button"
+                disabled={idx >= totalCount - 1}
+                onClick={() => onMoveQueueItem(idx, idx + 1)}
+                className="rounded p-1 text-zinc-500 transition hover:bg-obsidian-800 hover:text-white disabled:opacity-25"
+                title="Move down"
+              >
+                <ChevronDown className="h-3 w-3" />
+              </button>
+            </>
+          )}
+          {onRemove && (
+            <button
+              type="button"
+              onClick={() => onRemove(itemId)}
+              className="rounded p-1 text-zinc-500 transition hover:bg-red-500/20 hover:text-red-400"
+              title={tab === 'queue' ? 'Remove from playlist' : 'Delete from history'}
+            >
+              <Trash2 className="h-3 w-3" />
+            </button>
+          )}
+        </div>
+      </div>
 
       {/* Expanded Local Copy Drawer */}
       {isExpanded && !item.isOfflineReady && externalUrl && (
@@ -351,134 +506,6 @@ function SortableQueueCard({
           </div>
         </div>
       )}
-
-      {/* Cloud Vault & Local Offline Storage Controls Row */}
-      {(item.isOfflineReady || item.r2Key) && (
-        <div
-          onClick={(e) => e.stopPropagation()}
-          className="mt-2 flex flex-wrap items-center justify-between gap-1.5 border-t border-zinc-800/60 pt-1.5"
-        >
-          <div className="flex flex-wrap items-center gap-1.5">
-            {/* Local item NOT yet in Cloud Vault -> Save to Cloud Vault */}
-            {item.isOfflineReady && !item.r2Key && onUploadToR2 && (
-              <button
-                type="button"
-                disabled={!isOnline || !r2Configured || Boolean(r2Transfer)}
-                onClick={() => onUploadToR2(item)}
-                title={
-                  r2Configured
-                    ? 'Upload to Cloudflare R2 Cloud Vault for cross-device streaming & sharing'
-                    : 'Configure Cloudflare R2 credentials on server to enable Cloud Vault'
-                }
-                className="inline-flex items-center gap-1 rounded-md bg-sky-500/15 px-2 py-0.5 text-[10px] font-semibold text-sky-300 transition hover:bg-sky-500/25 disabled:cursor-not-allowed disabled:opacity-45"
-              >
-                {r2Transfer?.itemId === itemId && r2Transfer.type === 'upload' ? (
-                  <>
-                    <Loader2 className="h-3 w-3 animate-spin" />
-                    Uploading {r2Transfer.pct ?? 0}%
-                  </>
-                ) : (
-                  <>
-                    <CloudUpload className="h-3 w-3" />
-                    Save to Cloud Vault
-                  </>
-                )}
-              </button>
-            )}
-
-            {/* Cloud Vault item NOT yet in local IndexedDB -> Save Offline */}
-            {item.r2Key && !item.isOfflineReady && onSaveR2Offline && (
-              <button
-                type="button"
-                disabled={!isOnline || Boolean(r2Transfer)}
-                onClick={() => onSaveR2Offline(item)}
-                title="Download from Cloud Vault into local IndexedDB (0 R2 requests on future plays)"
-                className="inline-flex items-center gap-1 rounded-md bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-300 transition hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-45"
-              >
-                {r2Transfer?.itemId === itemId && r2Transfer.type === 'download' ? (
-                  <>
-                    <Loader2 className="h-3 w-3 animate-spin" />
-                    Saving {r2Transfer.pct != null ? `${r2Transfer.pct}%` : '...'}
-                  </>
-                ) : (
-                  <>
-                    <CloudDownload className="h-3 w-3" />
-                    Save Offline
-                  </>
-                )}
-              </button>
-            )}
-          </div>
-
-          <div className="flex items-center gap-1.5">
-            {item.r2Key && canManageCloudItem && onDeleteFromR2 && (
-              <button
-                type="button"
-                disabled={!isOnline || Boolean(r2Transfer)}
-                onClick={() => onDeleteFromR2(item)}
-                className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[10px] font-medium text-zinc-400 transition hover:bg-red-500/15 hover:text-red-400 disabled:opacity-40"
-                title="Delete video from Cloudflare R2 Cloud Vault"
-              >
-                <CloudOff className="h-3 w-3" />
-                Delete Cloud
-              </button>
-            )}
-
-            {item.isOfflineReady && onDeleteLocalFile && (
-              <button
-                type="button"
-                onClick={() => onDeleteLocalFile(item)}
-                className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[10px] font-medium text-zinc-400 transition hover:bg-red-500/15 hover:text-red-400"
-                title="Delete local blob from IndexedDB to free device storage"
-              >
-                <FolderX className="h-3 w-3" />
-                Delete Local
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* One-Thumb Move Up / Down + Delete Controls */}
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="absolute right-1.5 top-1.5 flex items-center gap-0.5 opacity-85 transition-opacity sm:opacity-0 sm:group-hover:opacity-100"
-      >
-        {tab === 'queue' && onMoveQueueItem && (
-          <>
-            {idx > 0 && (
-              <button
-                type="button"
-                onClick={() => onMoveQueueItem(idx, idx - 1)}
-                className="rounded bg-obsidian-800/95 p-1 text-zinc-400 hover:text-white"
-                title="Move up"
-              >
-                <ChevronUp className="h-3 w-3" />
-              </button>
-            )}
-            {idx < totalCount - 1 && (
-              <button
-                type="button"
-                onClick={() => onMoveQueueItem(idx, idx + 1)}
-                className="rounded bg-obsidian-800/95 p-1 text-zinc-400 hover:text-white"
-                title="Move down"
-              >
-                <ChevronDown className="h-3 w-3" />
-              </button>
-            )}
-          </>
-        )}
-        {onRemove && (
-          <button
-            type="button"
-            onClick={() => onRemove(itemId)}
-            className="rounded bg-obsidian-800/95 p-1 text-zinc-400 hover:bg-red-500/20 hover:text-red-400"
-            title={tab === 'queue' ? 'Remove from playlist' : 'Delete from history'}
-          >
-            <Trash2 className="h-3 w-3" />
-          </button>
-        )}
-      </div>
     </div>
   );
 }
@@ -520,16 +547,24 @@ export default function QueuePanel({
   onNotify,
 }) {
   const [tab, setTab] = useState('queue');
+  const [viewMode, setViewMode] = useState(() => loadSavedViewMode()); // 'details' | 'thumbnails'
   const [expandedCopyId, setExpandedCopyId] = useState(null);
   const [copiedId, setCopiedId] = useState(null);
   const [batchFormat, setBatchFormat] = useState('mp4');
 
-  // Playlist creation / renaming inline state
-  const [playlistFormMode, setPlaylistFormMode] = useState(null); // null | 'create' | 'rename'
+  const [playlistFormMode, setPlaylistFormMode] = useState(null);
   const [playlistNameDraft, setPlaylistNameDraft] = useState('');
 
   const replaceTargetRef = useRef(null);
   const replaceInputRef = useRef(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(VIEW_MODE_KEY, viewMode);
+    } catch {
+      // ignore
+    }
+  }, [viewMode]);
 
   const activePlaylist =
     playlists.find((p) => p.id === activePlaylistId) || playlists[0] || null;
@@ -545,7 +580,6 @@ export default function QueuePanel({
     batchDownload && batchDownload.playlistId === activePlaylist?.id
   );
 
-  // Configure dnd-kit sensors (Pointer activation distance + TouchSensor on grip handle)
   const sensors = useSensors(
     useSensor(PointerSensor, {
       activationConstraint: { distance: 6 },
@@ -632,8 +666,7 @@ export default function QueuePanel({
   const sortableIds = queue.map((i) => i.id || i.videoId);
 
   return (
-    <aside className="flex h-full flex-col rounded-2xl border border-zinc-800/80 bg-obsidian-900/90 p-4">
-      {/* Hidden input for upgrading any queue/history item to a local copy */}
+    <aside className="flex max-h-[65vh] flex-col overflow-hidden rounded-2xl border border-zinc-800/80 bg-obsidian-900/90 p-3.5 lg:h-full lg:max-h-none lg:min-h-0">
       <input
         ref={replaceInputRef}
         type="file"
@@ -642,9 +675,9 @@ export default function QueuePanel({
         className="hidden"
       />
 
-      {/* Tabs */}
-      <div className="mb-3 flex items-center justify-between gap-2">
-        <div className="flex w-full rounded-xl bg-obsidian-950 p-1">
+      {/* Tabs + Google Drive–Style View Toggle (Details vs Thumbnails) */}
+      <div className="mb-2.5 flex shrink-0 items-center gap-2">
+        <div className="flex flex-1 rounded-xl bg-obsidian-950 p-1">
           <button
             type="button"
             onClick={() => setTab('queue')}
@@ -670,17 +703,50 @@ export default function QueuePanel({
             History ({history.length})
           </button>
         </div>
+
+        {/* Details vs Thumbnails Explorer Toggle */}
+        <div
+          className="flex shrink-0 items-center rounded-xl border border-zinc-800 bg-obsidian-950 p-0.5"
+          title="Switch between Details list (full titles) and Thumbnails view"
+        >
+          <button
+            type="button"
+            onClick={() => setViewMode('details')}
+            title="Details View (Full Titles, No Thumbnails)"
+            aria-label="Details View"
+            className={`rounded-lg p-1.5 transition ${
+              viewMode === 'details'
+                ? 'bg-amber-500 text-black'
+                : 'text-zinc-400 hover:text-white'
+            }`}
+          >
+            <LayoutList className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode('thumbnails')}
+            title="Thumbnails View"
+            aria-label="Thumbnails View"
+            className={`rounded-lg p-1.5 transition ${
+              viewMode === 'thumbnails'
+                ? 'bg-amber-500 text-black'
+                : 'text-zinc-400 hover:text-white'
+            }`}
+          >
+            <ImageIcon className="h-3.5 w-3.5" />
+          </button>
+        </div>
       </div>
 
-      {/* Named Playlist Switcher Bar (Queue Tab) */}
+      {/* Named Playlist Switcher Bar & Offline Download Trigger (pinned non-scrolling header) */}
       {tab === 'queue' && (
-        <div className="mb-3 space-y-2">
+        <div className="mb-2.5 shrink-0 space-y-2">
           <div className="flex items-center gap-1.5">
             <select
               value={activePlaylist?.id || ''}
               onChange={(e) => onSelectPlaylist?.(e.target.value)}
               aria-label="Select active playlist"
-              className="min-w-0 flex-1 truncate rounded-xl border border-zinc-800 bg-obsidian-950 px-2.5 py-2 text-xs font-semibold text-zinc-100 focus:border-amber-500/70 focus:outline-none"
+              className="min-w-0 flex-1 truncate rounded-xl border border-zinc-800 bg-obsidian-950 px-2.5 py-1.5 text-xs font-semibold text-zinc-100 focus:border-amber-500/70 focus:outline-none"
             >
               {playlists.map((pl) => (
                 <option key={pl.id} value={pl.id} className="bg-obsidian-950 text-zinc-100">
@@ -696,7 +762,7 @@ export default function QueuePanel({
                 setPlaylistNameDraft('');
               }}
               title="New Playlist"
-              className="flex shrink-0 items-center gap-1 rounded-xl border border-zinc-800 bg-obsidian-950 px-2 py-2 text-[11px] font-semibold text-amber-400 transition hover:border-amber-500/50 hover:bg-obsidian-800"
+              className="flex shrink-0 items-center gap-1 rounded-xl border border-zinc-800 bg-obsidian-950 px-2 py-1.5 text-[11px] font-semibold text-amber-400 transition hover:border-amber-500/50 hover:bg-obsidian-800"
             >
               <Plus className="h-3.5 w-3.5" />
               <span className="hidden xl:inline">New</span>
@@ -712,7 +778,7 @@ export default function QueuePanel({
                       ? 'Shared with Friends (click to make private)'
                       : 'Private Playlist (click to share with friends)'
                   }
-                  className={`shrink-0 rounded-xl border p-2 transition ${
+                  className={`shrink-0 rounded-xl border p-1.5 transition ${
                     activePlaylist?.isSharedWithFriends
                       ? 'border-sky-500/50 bg-sky-500/15 text-sky-300'
                       : 'border-zinc-800 bg-obsidian-950 text-zinc-400 hover:border-zinc-700 hover:text-white'
@@ -729,7 +795,7 @@ export default function QueuePanel({
                     setPlaylistNameDraft(activePlaylist.name);
                   }}
                   title="Rename Playlist"
-                  className="shrink-0 rounded-xl border border-zinc-800 bg-obsidian-950 p-2 text-zinc-400 transition hover:border-zinc-700 hover:text-white"
+                  className="shrink-0 rounded-xl border border-zinc-800 bg-obsidian-950 p-1.5 text-zinc-400 transition hover:border-zinc-700 hover:text-white"
                 >
                   <Pencil className="h-3.5 w-3.5" />
                 </button>
@@ -739,7 +805,7 @@ export default function QueuePanel({
                     type="button"
                     onClick={() => activePlaylist && onDeletePlaylist?.(activePlaylist.id)}
                     title="Delete Playlist"
-                    className="shrink-0 rounded-xl border border-zinc-800 bg-obsidian-950 p-2 text-zinc-400 transition hover:border-red-500/40 hover:text-red-400"
+                    className="shrink-0 rounded-xl border border-zinc-800 bg-obsidian-950 p-1.5 text-zinc-400 transition hover:border-red-500/40 hover:text-red-400"
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
@@ -755,7 +821,6 @@ export default function QueuePanel({
             </div>
           )}
 
-          {/* Inline Create / Rename Form */}
           {playlistFormMode && (
             <form
               onSubmit={handlePlaylistFormSubmit}
@@ -790,9 +855,8 @@ export default function QueuePanel({
             </form>
           )}
 
-          {/* Local Multi-File Import Progress */}
           {localImportProgress && (
-            <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-[11px] font-medium text-emerald-300">
+            <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-[11px] font-medium text-emerald-300">
               <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
               <span className="truncate">
                 Importing {localImportProgress.current} of {localImportProgress.total} files...
@@ -800,9 +864,8 @@ export default function QueuePanel({
             </div>
           )}
 
-          {/* Sticky Sequential Offline Playlist Download Progress Bar */}
           {batchDownload && (
-            <div className="sticky top-0 z-20 space-y-2 rounded-xl border border-emerald-500/40 bg-obsidian-950/95 p-2.5 shadow-lg backdrop-blur-md">
+            <div className="space-y-1.5 rounded-xl border border-emerald-500/40 bg-obsidian-950/95 p-2.5 shadow-lg">
               <div className="flex items-center justify-between gap-2 text-[11px]">
                 <span className="flex min-w-0 items-center gap-1.5 font-semibold text-emerald-300">
                   {batchDownload.status === 'paused' ? (
@@ -869,9 +932,8 @@ export default function QueuePanel({
             </div>
           )}
 
-          {/* Download Playlist Offline Trigger Bar (when playlist has online YouTube items) */}
           {!isBatchActiveForThisPlaylist && pendingYouTubeCount > 0 && (
-            <div className="flex flex-wrap items-center justify-between gap-1.5 rounded-xl border border-emerald-500/25 bg-emerald-500/5 p-2">
+            <div className="flex flex-wrap items-center justify-between gap-1.5 rounded-xl border border-emerald-500/25 bg-emerald-500/5 p-1.5">
               <div className="flex rounded-lg bg-obsidian-950 p-0.5 text-[10px] font-bold">
                 <button
                   type="button"
@@ -912,8 +974,8 @@ export default function QueuePanel({
         </div>
       )}
 
-      {/* Item List */}
-      <div className="flex-1 space-y-2.5 overflow-y-auto pr-1">
+      {/* Independently Scrollable Lecture List (keeps active video player locked in viewport!) */}
+      <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
         {items.length === 0 ? (
           <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-zinc-800 py-10 text-center">
             <p className="text-xs font-medium text-zinc-400">
@@ -940,6 +1002,7 @@ export default function QueuePanel({
                     item={item}
                     idx={idx}
                     totalCount={queue.length}
+                    viewMode={viewMode}
                     isSortable={activePlaylist?.isOwner !== false}
                     isActive={itemId === activeItemId}
                     isOnline={isOnline}
@@ -984,6 +1047,7 @@ export default function QueuePanel({
                 item={item}
                 idx={idx}
                 totalCount={history.length}
+                viewMode={viewMode}
                 isSortable={false}
                 isActive={itemId === activeItemId}
                 isOnline={isOnline}

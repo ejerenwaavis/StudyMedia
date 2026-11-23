@@ -511,8 +511,8 @@ const VideoPlayer = forwardRef(function VideoPlayer(
           : isNativeFullscreen
           ? 'relative h-full w-full rounded-none border-0'
           : theaterMode
-          ? 'relative aspect-[16/9] max-h-[78vh] w-full rounded-2xl border border-zinc-800/80'
-          : 'relative aspect-video w-full rounded-2xl border border-zinc-800/80'
+          ? 'relative aspect-[16/9] w-full rounded-2xl border border-zinc-800/80 lg:aspect-auto lg:h-full'
+          : 'relative aspect-video w-full rounded-2xl border border-zinc-800/80 lg:aspect-auto lg:h-full'
       }`}
     >
       {/* Hidden local file replacement input */}
